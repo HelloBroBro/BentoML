@@ -33,6 +33,7 @@ if TYPE_CHECKING:
 
     from prometheus_client.samples import Sample
 
+    from _bentoml_sdk import Service as NewService
     from bentoml import Service
 
     from ...server.metrics.prometheus import PrometheusClient
@@ -127,12 +128,16 @@ def track(event_properties: EventMeta):
 
 @inject
 def _track_serve_init(
-    svc: Service,
+    svc: Service | NewService[t.Any],
     production: bool,
     serve_kind: str,
     from_server_api: bool,
     serve_info: ServeInfo = Provide[BentoMLContainer.serve_info],
 ):
+    from bentoml import Service
+
+    is_legacy = isinstance(svc, Service)
+
     if svc.bento is not None:
         bento = svc.bento
         event_properties = ServeInitEvent(
@@ -142,15 +147,36 @@ def _track_serve_init(
             production=production,
             serve_kind=serve_kind,
             bento_creation_timestamp=bento.info.creation_time,
-            num_of_models=len(bento.info.models),
-            num_of_runners=len(svc.runners),
+            num_of_models=len(bento.info.all_models),
+            num_of_runners=len(svc.runners) if is_legacy else len(svc.dependencies),
             num_of_apis=len(bento.info.apis),
-            model_types=[m.module for m in bento.info.models],
+            model_types=[m.module for m in bento.info.all_models],
             runnable_types=[r.runnable_type for r in bento.info.runners],
             api_input_types=[api.input_type for api in bento.info.apis],
             api_output_types=[api.output_type for api in bento.info.apis],
         )
     else:
+        if is_legacy:
+            num_models = len(
+                set(
+                    svc.models
+                    + [model for runner in svc.runners for model in runner.models]
+                )
+            )
+        else:
+            from bentoml import Model
+
+            def _get_models(svc: NewService[t.Any], seen: set[str]) -> t.Set[Model]:
+                if svc.name in seen:
+                    return set()
+                seen.add(svc.name)
+                models = set(svc.models)
+                for dep in svc.dependencies.values():
+                    models.update(_get_models(dep.on, seen))
+                return models
+
+            num_models = len(_get_models(svc, set()))
+
         event_properties = ServeInitEvent(
             serve_id=serve_info.serve_id,
             serve_from_bento=False,
@@ -158,19 +184,20 @@ def _track_serve_init(
             production=production,
             serve_kind=serve_kind,
             bento_creation_timestamp=None,
-            num_of_models=len(
-                set(
-                    svc.models
-                    + [model for runner in svc.runners for model in runner.models]
-                )
-            ),
-            num_of_runners=len(svc.runners),
+            num_of_models=num_models,
+            num_of_runners=len(svc.runners) if is_legacy else len(svc.dependencies),
             num_of_apis=len(svc.apis.keys()),
-            runnable_types=[r.runnable_class.__name__ for r in svc.runners],
-            api_input_types=[api.input.__class__.__name__ for api in svc.apis.values()],
+            runnable_types=[r.runnable_class.__name__ for r in svc.runners]
+            if is_legacy
+            else [d.on.name for d in svc.dependencies.values()],
+            api_input_types=[api.input.__class__.__name__ for api in svc.apis.values()]
+            if is_legacy
+            else [],
             api_output_types=[
                 api.output.__class__.__name__ for api in svc.apis.values()
-            ],
+            ]
+            if is_legacy
+            else [],
         )
 
     track(event_properties)
@@ -241,7 +268,7 @@ def get_metrics_report(
 @inject
 @contextlib.contextmanager
 def track_serve(
-    svc: Service,
+    svc: Service | NewService[t.Any],
     *,
     production: bool = False,
     from_server_api: bool | None = None,

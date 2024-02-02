@@ -15,6 +15,7 @@ And join us in the BentoML slack community: https://l.bentoml.com/join-slack
 """
 
 from typing import TYPE_CHECKING
+from typing import Any
 
 from ._internal.configuration import BENTOML_VERSION as __version__
 from ._internal.configuration import load_config
@@ -23,6 +24,8 @@ from ._internal.configuration import set_serialization_strategy
 
 # Inject dependencies and configurations
 load_config()
+
+from pydantic import Field
 
 # BentoML built-in types
 from ._internal.bento import Bento
@@ -96,8 +99,16 @@ if TYPE_CHECKING:
     from . import server  # Server API
     from . import monitoring  # Monitoring API
     from . import cloud  # Cloud API
+    from . import deployment  # deployment API
+    from . import validators  # validators
 
     # isort: on
+    from _bentoml_impl.client import AsyncHTTPClient
+    from _bentoml_impl.client import SyncHTTPClient
+    from _bentoml_sdk import api
+    from _bentoml_sdk import depends
+    from _bentoml_sdk import runner_service
+    from _bentoml_sdk import service
 else:
     from ._internal.utils import LazyLoader as _LazyLoader
 
@@ -154,8 +165,26 @@ else:
     exceptions = _LazyLoader("bentoml.exceptions", globals(), "bentoml.exceptions")
     monitoring = _LazyLoader("bentoml.monitoring", globals(), "bentoml.monitoring")
     cloud = _LazyLoader("bentoml.cloud", globals(), "bentoml.cloud")
-
+    deployment = _LazyLoader("bentoml.deployment", globals(), "bentoml.deployment")
+    validators = _LazyLoader("bentoml.validators", globals(), "bentoml.validators")
     del _LazyLoader
+
+    _NEW_SDK_ATTRS = ["service", "runner_service", "api", "depends"]
+    _NEW_CLIENTS = ["SyncHTTPClient", "AsyncHTTPClient"]
+
+    def __getattr__(name: str) -> Any:
+        if name not in _NEW_SDK_ATTRS + _NEW_CLIENTS:
+            raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+        import _bentoml_sdk
+
+        if name in _NEW_CLIENTS:
+            import _bentoml_impl.client
+
+            return getattr(_bentoml_impl.client, name)
+        else:
+            return getattr(_bentoml_sdk, name)
+
 
 __all__ = [
     "__version__",
@@ -194,6 +223,7 @@ __all__ = [
     "catboost",
     "detectron",
     "diffusers",
+    "diffusers_simple",
     "easyocr",
     "flax",
     "fastai",
@@ -220,6 +250,7 @@ __all__ = [
     # integrations
     "ray",
     "cloud",
+    "deployment",
     "triton",
     "monitor",
     "load_config",
@@ -227,4 +258,14 @@ __all__ = [
     "set_serialization_strategy",
     "Strategy",
     "Resource",
+    # new SDK
+    "service",
+    "runner_service",
+    "api",
+    "depends",
+    "validators",
+    "Field",
+    # new implementation
+    "SyncHTTPClient",
+    "AsyncHTTPClient",
 ]

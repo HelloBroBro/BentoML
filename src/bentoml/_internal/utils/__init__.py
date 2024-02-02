@@ -482,11 +482,59 @@ class compose:
         return (self.__wrapped__,) + tuple(self._wrappers)
 
 
-def is_async_callable(obj: t.Any) -> t.TypeGuard[t.Callable[..., t.Awaitable[t.Any]]]:
-    # Borrowed from starlette._utils
+def get_original_func(obj: t.Callable[..., t.Any]) -> t.Callable[..., t.Any]:
+    """
+    Get the original function from a decorated function
+    """
+    if getattr(obj, "__is_bentoml_api_func__", False):
+        obj = obj.func  # type: ignore
     while isinstance(obj, functools.partial):
         obj = obj.func
+    return obj
+
+
+def is_async_callable(obj: t.Any) -> t.TypeGuard[t.Callable[..., t.Awaitable[t.Any]]]:
+    obj = get_original_func(obj)
 
     return asyncio.iscoroutinefunction(obj) or (
         callable(obj) and asyncio.iscoroutinefunction(obj.__call__)
     )
+
+
+def async_gen_to_sync(
+    gen: t.AsyncGenerator[T, None], *, loop: asyncio.AbstractEventLoop | None = None
+) -> t.Generator[T, None, None]:
+    """
+    Convert an async generator to a sync generator
+    """
+    if loop is None:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    try:
+        while True:
+            yield loop.run_until_complete(gen.__anext__())
+    except StopAsyncIteration:
+        pass
+    finally:
+        loop.close()
+        asyncio.set_event_loop(None)
+
+
+async def sync_gen_to_async(
+    gen: t.Generator[T, None, None],
+) -> t.AsyncGenerator[T, None]:
+    """
+    Convert a sync generator to an async generator
+    """
+    from starlette.concurrency import run_in_threadpool
+
+    while True:
+        try:
+            rv = await run_in_threadpool(gen.__next__)
+            yield rv
+        except StopIteration:
+            break
+
+
+def dict_filter_none(d: dict[str, t.Any]) -> dict[str, t.Any]:
+    return {k: v for k, v in d.items() if v is not None}

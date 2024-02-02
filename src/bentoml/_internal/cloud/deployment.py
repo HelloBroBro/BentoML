@@ -1,29 +1,42 @@
 from __future__ import annotations
 
-import json
 import logging
+import time
 import typing as t
+from os import path
 
 import attr
+import click
+import yaml
 from deepmerge.merger import Merger
+from rich.live import Live
+from rich.progress import TaskID
+from simple_di import Provide
+from simple_di import inject
+
+from bentoml._internal.cloud.base import Spinner
+
+if t.TYPE_CHECKING:
+    from _bentoml_impl.client import AsyncHTTPClient
+    from _bentoml_impl.client import SyncHTTPClient
+    from bentoml._internal.bento.bento import BentoStore
+    from bentoml._internal.cloud.bentocloud import BentoCloudClient
+
 
 from ...exceptions import BentoMLException
+from ...exceptions import NotFound
+from ..bento.bento import BentoInfo
+from ..configuration.containers import BentoMLContainer
 from ..tag import Tag
 from ..utils import bentoml_cattr
-from ..utils import first_not_none
 from ..utils import resolve_user_filepath
 from .config import get_rest_api_client
-from .schemas import CreateDeploymentSchema
-from .schemas import DeploymentListSchema
-from .schemas import DeploymentMode
-from .schemas import DeploymentSchema
-from .schemas import DeploymentTargetCanaryRule
-from .schemas import DeploymentTargetConfig
-from .schemas import DeploymentTargetHPAConf
-from .schemas import DeploymentTargetRunnerConfig
-from .schemas import DeploymentTargetType
-from .schemas import FullDeploymentSchema
-from .schemas import UpdateDeploymentSchema
+from .schemas.modelschemas import DeploymentStatus
+from .schemas.modelschemas import DeploymentTargetHPAConf
+from .schemas.schemasv2 import CreateDeploymentSchema as CreateDeploymentSchemaV2
+from .schemas.schemasv2 import DeploymentSchema
+from .schemas.schemasv2 import DeploymentTargetSchema
+from .schemas.schemasv2 import UpdateDeploymentSchema as UpdateDeploymentSchemaV2
 
 logger = logging.getLogger(__name__)
 
@@ -38,525 +51,763 @@ config_merger = Merger(
 
 
 @attr.define
-class Resource:
-    @classmethod
-    def for_hpa_conf(cls, **kwargs: t.Any) -> DeploymentTargetHPAConf:
-        return bentoml_cattr.structure(kwargs, DeploymentTargetHPAConf)
+class DeploymentConfigParameters:
+    name: str | None = None
+    path_context: str | None = None
+    context: str | None = None
+    bento: Tag | str | None = None
+    cluster: str | None = None
+    access_authorization: bool | None = None
+    scaling_min: int | None = None
+    scaling_max: int | None = None
+    instance_type: str | None = None
+    strategy: str | None = None
+    envs: t.List[dict[str, t.Any]] | None = None
+    extras: dict[str, t.Any] | None = None
+    config_dict: dict[str, t.Any] | None = None
+    config_file: str | t.TextIO | None = None
+    cli: bool = False
+    service_name: str | None = None
+    cfg_dict: dict[str, t.Any] | None = None
+    _param_config: dict[str, t.Any] | None = None
 
-    @classmethod
-    def for_runner(cls, **kwargs: t.Any) -> DeploymentTargetRunnerConfig:
-        exclusive_api_server_key = {
-            v for v in kwargs if v not in attr.fields_dict(DeploymentTargetRunnerConfig)
-        }
-        return bentoml_cattr.structure(
-            {k: v for k, v in kwargs.items() if k not in exclusive_api_server_key},
-            DeploymentTargetRunnerConfig,
+    def verify(
+        self,
+    ):
+        deploy_by_param = (
+            self.name
+            or self.bento
+            or self.cluster
+            or self.access_authorization
+            or self.scaling_min
+            or self.scaling_max
+            or self.instance_type
+            or self.strategy
+            or self.envs
+            or self.extras
         )
 
-    @classmethod
-    def for_api_server(cls, **kwargs: t.Any) -> DeploymentTargetConfig:
-        return bentoml_cattr.structure(kwargs, DeploymentTargetConfig)
-
-
-class Deployment:
-    @classmethod
-    def _get_default_kube_namespace(
-        cls,
-        cluster_name: str,
-        context: str | None = None,
-    ) -> str:
-        cloud_rest_client = get_rest_api_client(context)
-        res = cloud_rest_client.get_cluster(cluster_name)
-        if not res:
-            raise BentoMLException("Cannot get default kube namespace")
-        return res.config.default_deployment_kube_namespace
-
-    @classmethod
-    def _get_default_cluster(cls, context: str | None = None) -> str:
-        cloud_rest_client = get_rest_api_client(context)
-        res = cloud_rest_client.get_cluster_list(params={"count": 1})
-        if not res:
-            raise BentoMLException("Failed to get list of clusters.")
-        if not res.items:
-            raise BentoMLException("Cannot get default clusters.")
-        return res.items[0].name
-
-    @classmethod
-    def _create_deployment(
-        cls,
-        create_deployment_schema: CreateDeploymentSchema,
-        context: str | None = None,
-        cluster_name: str | None = None,
-    ) -> DeploymentSchema:
-        cloud_rest_client = get_rest_api_client(context)
-        if cluster_name is None:
-            cluster_name = cls._get_default_cluster(context)
-        if create_deployment_schema.kube_namespace is None:
-            create_deployment_schema.kube_namespace = cls._get_default_kube_namespace(
-                cluster_name, context
-            )
-        for target in create_deployment_schema.targets:
-            if (
-                cloud_rest_client.get_bento(target.bento_repository, target.bento)
-                is None
-            ):
-                raise BentoMLException(
-                    f"Create deployment: {target.bento_repository}:{target.bento} does not exist"
-                )
         if (
-            cloud_rest_client.get_deployment(
-                cluster_name,
-                create_deployment_schema.kube_namespace,
-                create_deployment_schema.name,
-            )
-            is not None
+            self.config_dict
+            and self.config_file
+            or self.config_dict
+            and deploy_by_param
+            or self.config_file
+            and deploy_by_param
         ):
-            raise BentoMLException("Create deployment: Deployment already exists")
-        res = cloud_rest_client.create_deployment(
-            cluster_name, create_deployment_schema
-        )
-        if res is None:
-            raise BentoMLException("Create deployment request failed")
-        logger.debug("Deployment Schema: %s", create_deployment_schema)
-        return res
-
-    @classmethod
-    def _update_deployment(
-        cls,
-        deployment_name: str,
-        update_deployment_schema: UpdateDeploymentSchema,
-        kube_namespace: str | None = None,
-        context: str | None = None,
-        cluster_name: str | None = None,
-    ) -> DeploymentSchema:
-        cloud_rest_client = get_rest_api_client(context)
-        if cluster_name is None:
-            cluster_name = cls._get_default_cluster(context)
-        if kube_namespace is None:
-            kube_namespace = cls._get_default_kube_namespace(cluster_name, context)
-        for target in update_deployment_schema.targets:
-            if (
-                cloud_rest_client.get_bento(target.bento_repository, target.bento)
-                is None
-            ):
-                raise BentoMLException(
-                    f"Update deployment: {target.bento_repository}:{target.bento} does not exist"
-                )
-            cloud_rest_client.get_deployment(
-                cluster_name,
-                kube_namespace,
-                deployment_name,
-            )
-
-        res = cloud_rest_client.update_deployment(
-            cluster_name, kube_namespace, deployment_name, update_deployment_schema
-        )
-        if res is None:
-            raise BentoMLException("Update deployment request failed")
-        logger.debug("%s is created.", deployment_name)
-        logger.debug("Deployment Schema: %s", update_deployment_schema)
-        return res
-
-    @classmethod
-    def update(
-        cls,
-        deployment_name: str,
-        bento: Tag | str | None = None,
-        description: str | None = None,
-        expose_endpoint: bool | None = None,
-        cluster_name: str | None = None,
-        kube_namespace: str | None = None,
-        resource_instance: str | None = None,
-        hpa_conf: DeploymentTargetHPAConf | None = None,
-        runners_config: dict[str, DeploymentTargetRunnerConfig] | None = None,
-        api_server_config: DeploymentTargetConfig | None = None,
-        mode: DeploymentMode | None = None,
-        type: DeploymentTargetType | None = None,
-        context: str | None = None,
-        labels: dict[str, str] | None = None,
-        canary_rules: t.List[DeploymentTargetCanaryRule] | None = None,
-        latest_bento: bool = False,
-    ) -> DeploymentSchema:
-        from bentoml import get as get_bento
-
-        if mode is None:
-            mode = DeploymentMode.Function
-        if type is None:
-            type = DeploymentTargetType.STABLE
-
-        if cluster_name is None:
-            cluster_name = cls._get_default_cluster(context)
-        if kube_namespace is None:
-            kube_namespace = cls._get_default_kube_namespace(cluster_name, context)
-
-        base_schema = cls.get(deployment_name, context, cluster_name, kube_namespace)
-        # Deployment target always has length of 1
-        if base_schema.latest_revision is None:
             raise BentoMLException(
-                f"Deployment {deployment_name} has no latest revision"
+                "Configure a deployment can only use one of the following: config_dict, config_file, or the other parameters"
             )
-        deployment_target = base_schema.latest_revision.targets[0]
 
-        if bento is None:
-            # NOTE: bento.repository.name is the bento.name, and bento.name is the bento.version
-            # from bentocloud to bentoml.Tag concept
-            bento = deployment_target.bento.repository.name
+        if deploy_by_param:
+            self.cfg_dict = {
+                k: v
+                for k, v in [
+                    ("name", self.name),
+                    ("bento", self.bento),
+                    ("cluster", self.cluster),
+                    ("access_authorization", self.access_authorization),
+                    ("envs", self.envs),
+                ]
+                if v is not None
+            }
+            # add service name
+            self._param_config = {
+                k: v
+                for k, v in [
+                    ("scaling_min", self.scaling_min),
+                    ("scaling_max", self.scaling_max),
+                    ("instance_type", self.instance_type),
+                    ("strategy", self.strategy),
+                    ("extras", self.extras),
+                ]
+                if v is not None
+            }
+        elif self.config_dict:
+            self.cfg_dict = self.config_dict
+        elif isinstance(self.config_file, str):
+            real_path = resolve_user_filepath(self.config_file, self.path_context)
+            try:
+                with open(real_path, "r") as file:
+                    self.cfg_dict = yaml.safe_load(file)
+            except FileNotFoundError:
+                raise ValueError(f"File not found: {real_path}")
+            except yaml.YAMLError as exc:
+                logger.error("Error while parsing YAML file: %s", exc)
+                raise
+            except Exception as e:
+                raise ValueError(
+                    f"An error occurred while reading the file: {real_path}\n{e}"
+                )
+        elif self.config_file:
+            try:
+                self.cfg_dict = yaml.safe_load(self.config_file)
+            except yaml.YAMLError as exc:
+                logger.error("Error while parsing YAML config-file stream: %s", exc)
+                raise
+        else:
+            raise BentoMLException(
+                "Must provide either config_dict, config_file, or the other parameters"
+            )
+
+        bento_name = self.cfg_dict.get("bento")
+        # determine if bento is a path or a name
+        if bento_name:
+            if isinstance(bento_name, str) and path.exists(bento_name):
+                # target is a path
+                if self.cli:
+                    click.echo(f"building bento from {bento_name} ...")
+                bento_info = get_bento_info(
+                    project_path=bento_name,
+                    context=self.context,
+                )
+            else:
+                if self.cli:
+                    click.echo(f"using bento {bento_name}...")
+                bento_info = get_bento_info(
+                    bento=str(bento_name),
+                    context=self.context,
+                )
+            self.cfg_dict["bento"] = bento_info.tag
+            if self.service_name is None:
+                self.service_name = bento_info.entry_service
+
+    def get_name(self):
+        if self.cfg_dict is None:
+            raise BentoMLException(
+                "DeploymentConfigParameters.verify() must be called first"
+            )
+        return self.cfg_dict.get("name")
+
+    def get_cluster(self, pop: bool = True):
+        if self.cfg_dict is None:
+            raise BentoMLException(
+                "DeploymentConfigParameters.verify() must be called first"
+            )
+        if pop:
+            return self.cfg_dict.pop("cluster", None)
+        else:
+            return self.cfg_dict.get("cluster")
+
+    def get_config_dict(self, bento: str | None = None):
+        if self.cfg_dict is None:
+            raise BentoMLException(
+                "DeploymentConfigParameters.verify() must be called first"
+            )
+        if self.service_name is None:
+            if bento is None:
+                if self.cfg_dict.get("bento") is None:
+                    raise BentoMLException("Bento is required")
+                bento = self.cfg_dict.get("bento")
+
+            info = get_bento_info(
+                bento=bento,
+                context=self.context,
+            )
+            if info.entry_service == "":
+                # for compatibility
+                self.service_name = "apiserver"
+            else:
+                self.service_name = info.entry_service
+        if self._param_config is not None:
+            scaling_min = self._param_config.pop("scaling_min", None)
+            scaling_max = self._param_config.pop("scaling_max", None)
+            if scaling_min is not None or scaling_max is not None:
+                self._param_config["scaling"] = {
+                    "min_replicas": scaling_min,
+                    "max_replicas": scaling_max,
+                }
+                self._param_config["scaling"] = {
+                    k: v
+                    for k, v in self._param_config["scaling"].items()
+                    if v is not None
+                }
+
+            strategy = self._param_config.pop("strategy", None)
+            if strategy is not None:
+                self._param_config["deployment_strategy"] = strategy
+            self.cfg_dict["services"] = {self.service_name: self._param_config}
+
+        return self.cfg_dict
+
+
+def get_args_from_config(
+    name: str | None = None,
+    bento: Tag | str | None = None,
+    cluster: str | None = None,
+    config_dict: dict[str, t.Any] | None = None,
+    config_file: str | t.TextIO | None = None,
+    path_context: str | None = None,
+):
+    file_dict: dict[str, t.Any] | None = None
+
+    if name is None and config_dict is not None and "name" in config_dict:
+        name = config_dict["name"]
+    if bento is None and config_dict is not None and "bento" in config_dict:
+        bento = config_dict["bento"]
+    if cluster is None and config_dict is not None and "cluster" in config_dict:
+        cluster = config_dict["cluster"]
+
+    if isinstance(config_file, str):
+        real_path = resolve_user_filepath(config_file, path_context)
+        try:
+            with open(real_path, "r") as file:
+                file_dict = yaml.safe_load(file)
+        except FileNotFoundError:
+            raise ValueError(f"File not found: {real_path}")
+        except yaml.YAMLError as exc:
+            logger.error("Error while parsing YAML file: %s", exc)
+            raise
+        except Exception as e:
+            raise ValueError(
+                f"An error occurred while reading the file: {real_path}\n{e}"
+            )
+    elif config_file is not None:
+        try:
+            file_dict = yaml.safe_load(config_file)
+        except yaml.YAMLError as exc:
+            logger.error("Error while parsing YAML config-file stream: %s", exc)
+            raise
+
+    if file_dict is not None:
+        if bento is None and "bento" in file_dict:
+            bento = file_dict["bento"]
+        if name is None and "name" in file_dict:
+            name = file_dict["name"]
+        if cluster is None and "cluster" in file_dict:
+            cluster = file_dict["cluster"]
+
+    return name, bento, cluster
+
+
+@inject
+def get_bento_info(
+    project_path: str | None = None,
+    bento: str | Tag | None = None,
+    context: str | None = None,
+    _bento_store: BentoStore = Provide[BentoMLContainer.bento_store],
+    _cloud_client: BentoCloudClient = Provide[BentoMLContainer.bentocloud_client],
+) -> BentoInfo:
+    if project_path:
+        from bentoml.bentos import build_bentofile
+
+        bento_obj = build_bentofile(build_ctx=project_path, _bento_store=_bento_store)
+        _cloud_client.push_bento(bento=bento_obj, context=context)
+        return bento_obj.info
+    elif bento:
         bento = Tag.from_taglike(bento)
-        if latest_bento and bento.version is None or bento.version == "latest":
-            bento = get_bento(bento).tag
-        elif bento.version is None:
-            bento.version = deployment_target.bento.name
+        try:
+            bento_obj = _bento_store.get(bento)
+        except NotFound:
+            bento_obj = None
 
-        updated_config = bentoml_cattr.unstructure(deployment_target.config)
-        if hpa_conf is not None:
-            hpa_conf_dct = bentoml_cattr.unstructure(hpa_conf)
-            if "hpa_conf" in updated_config:
-                if updated_config["hpa_conf"] is None:
-                    updated_config["hpa_conf"] = {}
-                config_merger.merge(updated_config["hpa_conf"], hpa_conf_dct)
-            if "runners" in updated_config and updated_config["runners"] is not None:
-                for _, runner in updated_config["runners"].items():
-                    if runner["hpa_conf"] is None:
-                        runner["hpa_conf"] = {}
-                    config_merger.merge(runner["hpa_conf"], hpa_conf_dct)
-        if resource_instance is not None:
-            updated_config["resource_instance"] = resource_instance
-            if updated_config.get("runners") is not None:
-                for runner in updated_config["runners"].values():
-                    runner["resource_instance"] = resource_instance
-        if expose_endpoint is not None:
-            updated_config["enable_ingress"] = expose_endpoint
-
-        if api_server_config is not None:
-            if runners_config is not None:
-                api_server_config.runners = runners_config
-            config_merger.merge(
-                updated_config, bentoml_cattr.unstructure(api_server_config)
+        # try to get from bentocloud
+        try:
+            bento_schema = _cloud_client.get_bento(
+                context=context, name=bento.name, version=bento.version
             )
-        elif runners_config is not None:
-            config_merger.merge(
-                updated_config,
-                {
-                    "runners": {
-                        k: bentoml_cattr.unstructure(v)
-                        for k, v in runners_config.items()
-                    }
-                },
+        except NotFound:
+            bento_schema = None
+
+        if bento_obj is None and bento_schema is None:
+            raise NotFound(f"bento {bento} not found in both local and cloud")
+        elif bento_obj is not None and bento_schema is None:
+            # push to bentocloud
+            _cloud_client.push_bento(bento=bento_obj, context=context)
+            return bento_obj.info
+        else:
+            with Live(_cloud_client.spinner.progress_group):
+                _cloud_client.spinner.log_progress.add_task(
+                    f"[bold blue]Using bento {bento.name}:{bento.version} from bentocloud to deploy"
+                )
+            return BentoInfo(
+                tag=Tag(name=bento.name, version=bento.version),
+                entry_service=bento_schema.manifest.entry_service,
+                service=bento_schema.manifest.service,
             )
-
-        dct_update: dict[str, t.Any] = {
-            "mode": first_not_none(mode, base_schema.mode),
-            "labels": first_not_none(
-                [{"key": key, "value": value} for key, value in labels.items()]
-                if labels
-                else None,
-                [bentoml_cattr.unstructure(i) for i in base_schema.labels],
-            ),
-            "description": description,
-        }
-        update_target = {
-            "type": first_not_none(type, deployment_target.type),
-            "bento": first_not_none(bento.version, deployment_target.bento.name),
-            "bento_repository": first_not_none(
-                bento.name, deployment_target.bento.repository.name
-            ),
-            "config": updated_config,
-        }
-
-        rules = first_not_none(
-            [bentoml_cattr.unstructure(i) for i in canary_rules]
-            if canary_rules
-            else None,
-            [bentoml_cattr.unstructure(i) for i in deployment_target.canary_rules]
-            if deployment_target.canary_rules
-            else None,
+    else:
+        raise BentoMLException(
+            "Create a deployment needs a target; project path or bento is necessary"
         )
-        if rules:
-            update_target["canary_rules"] = rules
 
-        # update the target
-        dct_update["targets"] = [update_target]
 
-        return cls._update_deployment(
-            deployment_name=deployment_name,
-            update_deployment_schema=bentoml_cattr.structure(
-                dct_update, UpdateDeploymentSchema
-            ),
-            context=context,
-            cluster_name=cluster_name,
-            kube_namespace=kube_namespace,
+@attr.define
+class DeploymentConfig(CreateDeploymentSchemaV2):
+    def to_yaml(self, with_meta: bool = True):
+        config_dict = self.to_dict(with_meta=with_meta)
+        return yaml.dump(config_dict, sort_keys=False)
+
+    def to_dict(self, with_meta: bool = True):
+        config_dict = bentoml_cattr.unstructure(self)
+        if with_meta is False:
+            # delete name and bento
+            config_dict.pop("name", None)
+            config_dict.pop("bento", None)
+
+        return config_dict
+
+
+@attr.define
+class DeploymentState:
+    status: str
+    created_at: str
+    updated_at: str
+    # no error message for now
+    # error_msg: str
+
+    def to_dict(self) -> dict[str, t.Any]:
+        return bentoml_cattr.unstructure(self)
+
+
+@attr.define
+class DeploymentInfo:
+    name: str
+    admin_console: str
+    created_at: str
+    created_by: str
+    cluster: str
+    _context: t.Optional[str] = attr.field(alias="_context", repr=False)
+    _schema: DeploymentSchema = attr.field(alias="_schema", repr=False)
+    _urls: t.Optional[list[str]] = attr.field(alias="_urls", default=None, repr=False)
+
+    def to_dict(self) -> dict[str, t.Any]:
+        return {
+            "name": self.name,
+            "bento": self.get_bento(refetch=False),
+            "cluster": self.cluster,
+            "admin_console": self.admin_console,
+            "created_at": self.created_at,
+            "created_by": self.created_by,
+            "config": self.get_config(refetch=False).to_dict(with_meta=False),
+            "status": self.get_status(refetch=False).to_dict(),
+        }
+
+    def to_yaml(self):
+        return yaml.dump(self.to_dict(), sort_keys=False)
+
+    def _refetch(self) -> None:
+        res = Deployment.get(self.name, self.cluster, self._context)
+        self._schema = res._schema
+        self._urls = res._urls
+
+    def _refetch_target(self, refetch: bool) -> DeploymentTargetSchema:
+        if refetch:
+            self._refetch()
+        if self._schema.latest_revision is None:
+            raise BentoMLException(f"Deployment {self.name} has no latest revision")
+        if len(self._schema.latest_revision.targets) == 0:
+            raise BentoMLException(
+                f"Deployment {self.name} has no latest revision targets"
+            )
+        target = self._schema.latest_revision.targets[0]
+        if target is None:
+            raise BentoMLException(f"Deployment {self.name} has no target")
+        return target
+
+    def get_config(self, refetch: bool = True) -> DeploymentConfig:
+        target = self._refetch_target(refetch)
+        if target.config is None:
+            raise BentoMLException(f"Deployment {self.name} has no config")
+
+        return DeploymentConfig(
+            name=self.name,
+            bento=self.get_bento(refetch=False),
+            services=target.config.services,
+            access_authorization=target.config.access_authorization,
+            envs=target.config.envs,
         )
+
+    def get_status(self, refetch: bool = True) -> DeploymentState:
+        if refetch:
+            self._refetch()
+        updated_at = self._schema.created_at.strftime("%Y-%m-%d %H:%M:%S")
+        if self._schema.updated_at is not None:
+            updated_at = self._schema.updated_at.strftime("%Y-%m-%d %H:%M:%S")
+        return DeploymentState(
+            status=self._schema.status.value,
+            created_at=self._schema.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+            updated_at=updated_at,
+        )
+
+    def get_bento(self, refetch: bool = True) -> str:
+        target = self._refetch_target(refetch)
+        if target.bento is None:
+            raise BentoMLException(f"Deployment {self.name} has no bento")
+        return target.bento.repository.name + ":" + target.bento.version
+
+    def get_client(
+        self,
+        media_type: str = "application/json",
+        token: str | None = None,
+    ) -> SyncHTTPClient:
+        from _bentoml_impl.client import SyncHTTPClient
+
+        self._refetch()
+        if self._schema.status != DeploymentStatus.Running:
+            raise BentoMLException(f"Deployment status is {self._schema.status}")
+        if self._urls is None or len(self._urls) != 1:
+            raise BentoMLException("Deployment url is not ready")
+
+        return SyncHTTPClient(self._urls[0], media_type=media_type, token=token)
+
+    def get_async_client(
+        self,
+        media_type: str = "application/json",
+        token: str | None = None,
+    ) -> AsyncHTTPClient:
+        from _bentoml_impl.client import AsyncHTTPClient
+
+        self._refetch()
+        if self._schema.status != DeploymentStatus.Running:
+            raise BentoMLException(f"Deployment status is {self._schema.status}")
+        if self._urls is None or len(self._urls) != 1:
+            raise BentoMLException("Deployment url is not ready")
+        return AsyncHTTPClient(self._urls[0], media_type=media_type, token=token)
+
+    def wait_until_ready(
+        self,
+        timeout: int = 3600,
+        check_interval: int = 10,
+        spinner: Spinner | None = None,
+        spinner_task_id: TaskID | None = None,
+    ) -> None:
+        start_time = time.time()
+        if spinner is not None and spinner_task_id is not None:
+            while time.time() - start_time < timeout:
+                status = self.get_status()
+                spinner.spinner_progress.update(
+                    spinner_task_id,
+                    action=f"Waiting for deployment '{self.name}' to be ready. Current status: '{status.status}'.",
+                )
+                if status.status == DeploymentStatus.Running.value:
+                    spinner.spinner_progress.update(
+                        spinner_task_id,
+                        action=f'[bold green] Deployment "{self.name}" is ready.[/bold green]',
+                    )
+                    spinner.spinner_progress.stop_task(spinner_task_id)
+                    return
+                if status.status in [
+                    DeploymentStatus.Failed.value,
+                    DeploymentStatus.ImageBuildFailed.value,
+                    DeploymentStatus.Terminated.value,
+                    DeploymentStatus.Terminating.value,
+                    DeploymentStatus.Unhealthy.value,
+                ]:
+                    spinner.spinner_progress.update(
+                        spinner_task_id,
+                        action=f'[bold red]Deployment "{self.name}" is not ready. Current status: "{status.status}".[/bold red]',
+                    )
+                    spinner.spinner_progress.stop_task(spinner_task_id)
+                    return
+
+                time.sleep(check_interval)
+
+            spinner.spinner_progress.update(
+                spinner_task_id,
+                action=f'[bold red]Time out waiting for Deployment "{self.name}" ready.[/bold red]',
+            )
+            spinner.spinner_progress.stop_task(spinner_task_id)
+        else:
+            while time.time() - start_time < timeout:
+                status = self.get_status()
+                if status.status == DeploymentStatus.Running.value:
+                    logger.info(
+                        f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Deployment '{self.name}' is ready."
+                    )
+                    return
+                logger.info(
+                    f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Waiting for deployment '{self.name}' to be ready. Current status: '{status.status}'."
+                )
+                time.sleep(check_interval)
+
+        raise TimeoutError(
+            f"Timed out waiting for deployment '{self.name}' to be ready."
+        )
+
+
+@attr.define
+class Deployment:
+    @staticmethod
+    def _fix_scaling(
+        scaling: DeploymentTargetHPAConf | None,
+    ) -> DeploymentTargetHPAConf:
+        if scaling is None:
+            return DeploymentTargetHPAConf(1, 1)
+        if scaling.min_replicas is None:
+            scaling.min_replicas = 1
+        if scaling.max_replicas is None:
+            scaling.max_replicas = max(scaling.min_replicas, 1)
+        # one edge case:
+        if scaling.min_replicas > scaling.max_replicas:
+            raise BentoMLException(
+                "min scaling values must be less than or equal to max scaling values"
+            )
+        if scaling.min_replicas < 0:
+            raise BentoMLException(
+                "min scaling values must be greater than or equal to 0"
+            )
+        if scaling.max_replicas <= 0:
+            raise BentoMLException("max scaling values must be greater than 0")
+        return scaling
 
     @classmethod
-    def create(
+    def _fix_and_validate_schema(
         cls,
-        deployment_name: str,
-        bento: Tag | str,
-        description: str | None = None,
-        expose_endpoint: bool | None = None,
-        cluster_name: str | None = None,
-        kube_namespace: str | None = None,
-        resource_instance: str | None = None,
-        hpa_conf: DeploymentTargetHPAConf | None = None,
-        runners_config: dict[str, DeploymentTargetRunnerConfig] | None = None,
-        api_server_config: DeploymentTargetConfig | None = None,
-        mode: DeploymentMode | None = None,
-        type: DeploymentTargetType | None = None,
-        context: str | None = None,
-        labels: dict[str, str] | None = None,
-        canary_rules: t.List[DeploymentTargetCanaryRule] | None = None,
-    ) -> DeploymentSchema:
-        if mode is None:
-            mode = DeploymentMode.Function
-        if type is None:
-            type = DeploymentTargetType.STABLE
-        bento_tag = Tag.from_taglike(bento)
+        config_struct: UpdateDeploymentSchemaV2,
+    ):
+        # fix scaling
+        for _, svc in config_struct.services.items():
+            svc.scaling = cls._fix_scaling(svc.scaling)
 
-        dct: dict[str, t.Any] = {
-            "name": deployment_name,
-            "kube_namespace": kube_namespace,
-            "mode": mode,
-            "description": description,
-        }
-        if labels:
-            dct["labels"] = [
-                {"key": key, "value": value} for key, value in labels.items()
-            ]
-        if api_server_config is None:
-            _config: dict[str, t.Any] = {
-                "runners": {
-                    k: bentoml_cattr.unstructure(v) for k, v in runners_config.items()
-                }
-                if runners_config
-                else None,
-            }
-        else:
-            api_server_config.runners = runners_config
-            _config = bentoml_cattr.unstructure(api_server_config)
+    @staticmethod
+    def _convert_schema_to_update_schema(_schema: DeploymentSchema) -> dict[str, t.Any]:
+        if _schema.latest_revision is None:
+            raise BentoMLException(f"Deployment {_schema.name} has no latest revision")
+        if len(_schema.latest_revision.targets) == 0:
+            raise BentoMLException(
+                f"Deployment {_schema.name} has no latest revision targets"
+            )
+        target_schema = _schema.latest_revision.targets[0]
+        if target_schema is None:
+            raise BentoMLException(f"Deployment {_schema.name} has no target")
+        if target_schema.config is None:
+            raise BentoMLException(f"Deployment {_schema.name} has no config")
+        if target_schema.bento is None:
+            raise BentoMLException(f"Deployment {_schema.name} has no bento")
+        update_schema = UpdateDeploymentSchemaV2(
+            services=target_schema.config.services,
+            access_authorization=target_schema.config.access_authorization,
+            envs=target_schema.config.envs,
+            bento=target_schema.bento.repository.name + ":" + target_schema.bento.name,
+        )
+        return bentoml_cattr.unstructure(update_schema)
 
-        create_target: dict[str, t.Any] = {
-            "type": type,
-            "bento_repository": bento_tag.name,
-            "bento": bento_tag.version,
-            "config": _config,
-        }
-        if canary_rules:
-            create_target["canary_rules"] = [
-                bentoml_cattr.unstructure(i) for i in canary_rules
-            ]
+    @staticmethod
+    def _convert_schema_to_bento(_schema: DeploymentSchema) -> Tag:
+        if _schema.latest_revision is None:
+            raise BentoMLException(f"Deployment {_schema.name} has no latest revision")
+        target_schema = _schema.latest_revision.targets[0]
+        if target_schema is None:
+            raise BentoMLException(f"Deployment {_schema.name} has no target")
+        if target_schema.bento is None:
+            raise BentoMLException(f"Deployment {_schema.name} has no bento")
+        return Tag.from_taglike(
+            target_schema.bento.repository.name + ":" + target_schema.bento.name
+        )
 
-        # Only change the value by the top-level param if it is not provided already in api_server_config or runner_config
-        if hpa_conf:
-            hpa_conf_dct = bentoml_cattr.unstructure(hpa_conf)
-            _config_hpa_conf = _config.get("hpa_conf", None)
-            if _config_hpa_conf is None:
-                _config_hpa_conf = {}
-            for k, v in hpa_conf_dct.items():
-                if k not in _config_hpa_conf:
-                    _config_hpa_conf[k] = v
-                else:
-                    logger.warning(
-                        "Key %s is already set in API server config and will not be overwritten with hpa_conf.%s",
-                        k,
-                        k,
-                    )
-            _config["hpa_conf"] = _config_hpa_conf
-            if "runners" in _config and _config["runners"] is not None:
-                _runner_config = _config["runners"]
-                for runner in _runner_config.values():
-                    _runner_hpa_conf = runner.get("hpa_conf", None)
-                    if _runner_hpa_conf is None:
-                        _runner_hpa_conf = {}
-                    for k, v in hpa_conf_dct.items():
-                        if k not in _runner_hpa_conf:
-                            _runner_hpa_conf[k] = v
-                        else:
-                            logger.warning(
-                                "Key %s is already set in runner config and will not be overwritten with hpa_conf.%s",
-                                k,
-                                k,
-                            )
-                    runner["hpa_conf"] = _runner_hpa_conf
-
-        if resource_instance:
-            if "resource_instance" not in _config:
-                _config["resource_instance"] = resource_instance
-            if "runners" in _config and _config["runners"] is not None:
-                for runner in _config["runners"].values():
-                    if "resource_instance" not in runner:
-                        runner["resource_instance"] = resource_instance
-
-        if expose_endpoint is not None and _config.get("enable_ingress", None) is None:
-            _config["enable_ingress"] = expose_endpoint
-
-        # setup the create target itself
-        dct["targets"] = [create_target]
-
-        return cls._create_deployment(
-            context=context,
-            cluster_name=cluster_name,
-            create_deployment_schema=bentoml_cattr.structure(
-                dct, CreateDeploymentSchema
-            ),
+    @staticmethod
+    def _generate_deployment_info_(
+        context: str | None, res: DeploymentSchema, urls: list[str] | None = None
+    ) -> DeploymentInfo:
+        client = get_rest_api_client(context)
+        cluster_display_name = res.cluster.host_cluster_display_name
+        if cluster_display_name is None:
+            cluster_display_name = res.cluster.name
+        return DeploymentInfo(
+            name=res.name,
+            # TODO: update this after the url in the frontend is fixed
+            admin_console=f"{client.v1.endpoint}/clusters/{res.cluster.name}/namespaces/{res.kube_namespace}/deployments/{res.name}",
+            created_at=res.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+            created_by=res.creator.name,
+            cluster=cluster_display_name,
+            _schema=res,
+            _context=context,
+            _urls=urls,
         )
 
     @classmethod
     def list(
         cls,
         context: str | None = None,
-        cluster_name: str | None = None,
-        query: str | None = None,
+        cluster: str | None = None,
         search: str | None = None,
-        count: int | None = None,
-        start: int | None = None,
-    ) -> DeploymentListSchema:
+    ) -> list[DeploymentInfo]:
         cloud_rest_client = get_rest_api_client(context)
-        if cluster_name is None:
-            cluster_name = cls._get_default_cluster(context)
-        if query or start or count or search:
-            params = {"start": start, "count": count, "search": search, "q": query}
-            res = cloud_rest_client.get_deployment_list(cluster_name, **params)
-            if res is None:
-                raise BentoMLException("List deployments request failed")
-            return res
+        if cluster is None:
+            res_count = cloud_rest_client.v2.list_deployment(all=True, search=search)
+            if res_count.total == 0:
+                return []
+            res = cloud_rest_client.v2.list_deployment(
+                search=search, count=res_count.total, all=True
+            )
         else:
-            all_deployment = cloud_rest_client.get_deployment_list(cluster_name)
-            if all_deployment is None:
-                raise BentoMLException("List deployments request failed")
-            return all_deployment
+            res_count = cloud_rest_client.v2.list_deployment(cluster, search=search)
+            if res_count.total == 0:
+                return []
+            res = cloud_rest_client.v2.list_deployment(
+                cluster, search=search, count=res_count.total
+            )
+        return [cls._generate_deployment_info_(context, schema) for schema in res.items]
 
     @classmethod
-    def create_from_file(
+    def create(
         cls,
-        path_or_stream: str | t.TextIO,
-        path_context: str | None = None,
+        deployment_config_params: DeploymentConfigParameters,
         context: str | None = None,
-    ) -> DeploymentSchema:
-        if isinstance(path_or_stream, str):
-            real_path = resolve_user_filepath(path_or_stream, path_context)
-            try:
-                with open(real_path, "r") as file:
-                    data = json.load(file)
-            except FileNotFoundError:
-                raise ValueError(f"File not found: {real_path}")
-            except json.JSONDecodeError as e:
-                raise ValueError(f"Error decoding JSON file: {real_path}\n{e}")
-            except Exception as e:
-                raise ValueError(
-                    f"An error occurred while reading the file: {real_path}\n{e}"
-                )
-        else:
-            # load the data from trusted stream
-            data = json.load(path_or_stream)
-        deployment_schema = bentoml_cattr.structure(data, FullDeploymentSchema)
-        return cls._create_deployment(
-            create_deployment_schema=deployment_schema,
-            context=context,
-            cluster_name=deployment_schema.cluster_name,
+    ) -> DeploymentInfo:
+        cluster = deployment_config_params.get_cluster()
+        if (
+            deployment_config_params.cfg_dict is None
+            or deployment_config_params.cfg_dict.get("bento") is None
+        ):
+            raise ValueError("bento is required")
+
+        config_params = deployment_config_params.get_config_dict()
+        config_struct = bentoml_cattr.structure(config_params, CreateDeploymentSchemaV2)
+        cls._fix_and_validate_schema(config_struct)
+
+        cloud_rest_client = get_rest_api_client(context)
+        res = cloud_rest_client.v2.create_deployment(
+            create_schema=config_struct, cluster=cluster
         )
 
+        logger.debug("Deployment Schema: %s", config_struct)
+
+        return cls._generate_deployment_info_(context, res, res.urls)
+
     @classmethod
-    def update_from_file(
+    def update(
         cls,
-        path_or_stream: str | t.TextIO,
-        path_context: str | None = None,
+        deployment_config_params: DeploymentConfigParameters,
         context: str | None = None,
-    ) -> DeploymentSchema:
-        if isinstance(path_or_stream, str):
-            real_path = resolve_user_filepath(path_or_stream, path_context)
+    ) -> DeploymentInfo:
+        name = deployment_config_params.get_name()
+        if name is None:
+            raise ValueError("name is required")
+        cluster = deployment_config_params.get_cluster()
+
+        cloud_rest_client = get_rest_api_client(context)
+        deployment_schema = cloud_rest_client.v2.get_deployment(name, cluster)
+        orig_dict = cls._convert_schema_to_update_schema(deployment_schema)
+
+        config_params = deployment_config_params.get_config_dict(
+            orig_dict.get("bento"),
+        )
+
+        config_merger.merge(orig_dict, config_params)
+        config_struct = bentoml_cattr.structure(orig_dict, UpdateDeploymentSchemaV2)
+
+        cls._fix_and_validate_schema(config_struct)
+
+        res = cloud_rest_client.v2.update_deployment(
+            cluster=deployment_schema.cluster.host_cluster_display_name,
+            name=name,
+            update_schema=config_struct,
+        )
+        logger.debug("Deployment Schema: %s", config_struct)
+        return cls._generate_deployment_info_(context, res, res.urls)
+
+    @classmethod
+    def apply(
+        cls,
+        deployment_config_params: DeploymentConfigParameters,
+        context: str | None = None,
+    ) -> DeploymentInfo:
+        cloud_rest_client = get_rest_api_client(context)
+        name = deployment_config_params.get_name()
+        if name is not None:
             try:
-                with open(real_path, "r") as file:
-                    data = json.load(file)
-            except FileNotFoundError:
-                raise ValueError(f"File not found: {real_path}")
-            except json.JSONDecodeError as e:
-                raise ValueError(f"Error decoding JSON file: {real_path}\n{e}")
-            except Exception as e:
-                raise ValueError(
-                    f"An error occurred while reading the file: {real_path}\n{e}"
+                deployment_schema = cloud_rest_client.v2.get_deployment(
+                    name, deployment_config_params.get_cluster(pop=False)
                 )
-        else:
-            data = json.load(path_or_stream)
-        deployment_schema = bentoml_cattr.structure(data, FullDeploymentSchema)
-        return cls._update_deployment(
-            deployment_name=deployment_schema.name,
-            update_deployment_schema=deployment_schema,
+            except NotFound:
+                return cls.create(
+                    deployment_config_params=deployment_config_params,
+                    context=context,
+                )
+            # directly update the deployment with the schema, do not merge with the existing schema
+            if deployment_config_params.get_name() != deployment_schema.name:
+                raise BentoMLException(
+                    f"Deployment name cannot be changed, current name is {deployment_schema.name}"
+                )
+            if (
+                deployment_config_params.get_cluster(pop=False)
+                != deployment_schema.cluster.host_cluster_display_name
+            ):
+                raise BentoMLException(
+                    f"Deployment cluster cannot be changed, current cluster is {deployment_schema.cluster.host_cluster_display_name}"
+                )
+            config_struct = bentoml_cattr.structure(
+                deployment_config_params.get_config_dict(), UpdateDeploymentSchemaV2
+            )
+            cls._fix_and_validate_schema(config_struct)
+
+            res = cloud_rest_client.v2.update_deployment(
+                name=name,
+                update_schema=config_struct,
+                cluster=deployment_schema.cluster.host_cluster_display_name,
+            )
+            logger.debug("Deployment Schema: %s", config_struct)
+            return cls._generate_deployment_info_(context, res, res.urls)
+
+        return cls.create(
+            deployment_config_params=deployment_config_params,
             context=context,
-            cluster_name=deployment_schema.cluster_name,
-            kube_namespace=deployment_schema.kube_namespace,
         )
 
     @classmethod
     def get(
         cls,
-        deployment_name: str,
+        name: str,
+        cluster: str | None = None,
         context: str | None = None,
-        cluster_name: str | None = None,
-        kube_namespace: str | None = None,
-    ) -> DeploymentSchema:
+    ) -> DeploymentInfo:
         cloud_rest_client = get_rest_api_client(context)
-        if cluster_name is None:
-            cluster_name = cls._get_default_cluster(context)
-        if kube_namespace is None:
-            kube_namespace = cls._get_default_kube_namespace(cluster_name, context)
-        res = cloud_rest_client.get_deployment(
-            cluster_name, kube_namespace, deployment_name
-        )
-        if res is None:
-            raise BentoMLException("Get deployment request failed")
-        return res
-
-    @classmethod
-    def delete(
-        cls,
-        deployment_name: str,
-        context: str | None = None,
-        cluster_name: str | None = None,
-        kube_namespace: str | None = None,
-    ) -> DeploymentSchema:
-        cloud_rest_client = get_rest_api_client(context)
-        if cluster_name is None:
-            cluster_name = cls._get_default_cluster(context)
-        if kube_namespace is None:
-            kube_namespace = cls._get_default_kube_namespace(cluster_name, context)
-        res = cloud_rest_client.get_deployment(
-            cluster_name,
-            kube_namespace,
-            deployment_name,
-        )
-        if res is None:
-            raise BentoMLException("Delete deployment: Deployment does not exist")
-
-        res = cloud_rest_client.delete_deployment(
-            cluster_name, kube_namespace, deployment_name
-        )
-        if res is None:
-            raise BentoMLException("Delete deployment request failed")
-        return res
+        res = cloud_rest_client.v2.get_deployment(name, cluster)
+        return cls._generate_deployment_info_(context, res, res.urls)
 
     @classmethod
     def terminate(
         cls,
-        deployment_name: str,
+        name: str,
+        cluster: str | None = None,
         context: str | None = None,
-        cluster_name: str | None = None,
-        kube_namespace: str | None = None,
-    ) -> DeploymentSchema:
+    ) -> DeploymentInfo:
         cloud_rest_client = get_rest_api_client(context)
-        if cluster_name is None:
-            cluster_name = cls._get_default_cluster(context)
-        if kube_namespace is None:
-            kube_namespace = cls._get_default_kube_namespace(cluster_name, context)
-        res = cloud_rest_client.get_deployment(
-            cluster_name,
-            kube_namespace,
-            deployment_name,
-        )
-        if res is None:
-            raise BentoMLException("Teminate deployment: Deployment does not exist")
-        res = cloud_rest_client.terminate_deployment(
-            cluster_name, kube_namespace, deployment_name
-        )
-        if res is None:
-            raise BentoMLException("Terminate deployment request failed")
-        return res
+        res = cloud_rest_client.v2.terminate_deployment(name, cluster)
+        return cls._generate_deployment_info_(context, res, res.urls)
+
+    @classmethod
+    def delete(
+        cls,
+        name: str,
+        cluster: str | None = None,
+        context: str | None = None,
+    ) -> None:
+        cloud_rest_client = get_rest_api_client(context)
+        cloud_rest_client.v2.delete_deployment(name, cluster)
+
+    @classmethod
+    def list_instance_types(
+        cls,
+        cluster: str | None = None,
+        context: str | None = None,
+    ) -> list[InstanceTypeInfo]:
+        cloud_rest_client = get_rest_api_client(context)
+        res = cloud_rest_client.v2.list_instance_types(cluster)
+        return [
+            InstanceTypeInfo(
+                name=schema.display_name,
+                description=schema.description,
+                cpu=schema.config.resources.requests.cpu,
+                memory=schema.config.resources.requests.memory,
+                gpu=schema.config.resources.requests.gpu,
+                gpu_type=schema.config.gpu_config.type,
+                price=schema.config.price,
+            )
+            for schema in res
+        ]
+
+
+@attr.define
+class InstanceTypeInfo:
+    name: t.Optional[str] = None
+    price: t.Optional[str] = None
+    description: t.Optional[str] = None
+    cpu: t.Optional[str] = None
+    memory: t.Optional[str] = None
+    gpu: t.Optional[str] = None
+    gpu_type: t.Optional[str] = None
+
+    def to_dict(self):
+        return {k: v for k, v in attr.asdict(self).items() if v is not None and v != ""}

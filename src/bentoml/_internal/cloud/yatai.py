@@ -10,7 +10,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 import fs
-import requests
+import httpx
 from rich.live import Live
 from simple_di import Provide
 from simple_di import inject
@@ -29,25 +29,25 @@ from .base import FILE_CHUNK_SIZE
 from .base import CallbackIOWrapper
 from .base import CloudClient
 from .config import get_rest_api_client
-from .schemas import BentoApiSchema
-from .schemas import BentoManifestSchema
-from .schemas import BentoRunnerResourceSchema
-from .schemas import BentoRunnerSchema
-from .schemas import BentoUploadStatus
-from .schemas import CompleteMultipartUploadSchema
-from .schemas import CompletePartSchema
-from .schemas import CreateBentoRepositorySchema
-from .schemas import CreateBentoSchema
-from .schemas import CreateModelRepositorySchema
-from .schemas import CreateModelSchema
-from .schemas import FinishUploadBentoSchema
-from .schemas import FinishUploadModelSchema
-from .schemas import LabelItemSchema
-from .schemas import ModelManifestSchema
-from .schemas import ModelUploadStatus
-from .schemas import PreSignMultipartUploadUrlSchema
-from .schemas import TransmissionStrategy
-from .schemas import UpdateBentoSchema
+from .schemas.modelschemas import BentoApiSchema
+from .schemas.modelschemas import BentoRunnerResourceSchema
+from .schemas.modelschemas import BentoRunnerSchema
+from .schemas.schemasv1 import BentoManifestSchema
+from .schemas.schemasv1 import BentoUploadStatus
+from .schemas.schemasv1 import CompleteMultipartUploadSchema
+from .schemas.schemasv1 import CompletePartSchema
+from .schemas.schemasv1 import CreateBentoRepositorySchema
+from .schemas.schemasv1 import CreateBentoSchema
+from .schemas.schemasv1 import CreateModelRepositorySchema
+from .schemas.schemasv1 import CreateModelSchema
+from .schemas.schemasv1 import FinishUploadBentoSchema
+from .schemas.schemasv1 import FinishUploadModelSchema
+from .schemas.schemasv1 import LabelItemSchema
+from .schemas.schemasv1 import ModelManifestSchema
+from .schemas.schemasv1 import ModelUploadStatus
+from .schemas.schemasv1 import PreSignMultipartUploadUrlSchema
+from .schemas.schemasv1 import TransmissionStrategy
+from .schemas.schemasv1 import UpdateBentoSchema
 
 if t.TYPE_CHECKING:
     from concurrent.futures import Future
@@ -88,7 +88,7 @@ class YataiClient(CloudClient):
         if version is None:
             raise BentoMLException(f"Bento {bento.tag} version cannot be None")
         info = bento.info
-        model_tags = [m.tag for m in info.models]
+        model_tags = [m.tag for m in info.all_models]
         local_model_store = bento._model_store  # type: ignore  # Using internal BentoML APIs
         if local_model_store is not None and len(local_model_store.list()) > 0:
             model_store = local_model_store
@@ -135,7 +135,7 @@ class YataiClient(CloudClient):
             LabelItemSchema(key=key, value=value) for key, value in info.labels.items()
         ]
         apis: dict[str, BentoApiSchema] = {}
-        models = [str(m.tag) for m in info.models]
+        models = [str(m.tag) for m in info.all_models]
         runners = [
             BentoRunnerSchema(
                 name=r.name,
@@ -152,12 +152,16 @@ class YataiClient(CloudClient):
             for r in info.runners
         ]
         manifest = BentoManifestSchema(
+            name=info.name,
+            entry_service=info.entry_service,
             service=info.service,
             bentoml_version=info.bentoml_version,
             apis=apis,
             models=models,
             runners=runners,
             size_bytes=bento.total_size(),
+            config=info.config,
+            schema=info.schema,
         )
         if not remote_bento:
             with self.spin(text=f'Registering Bento "{bento.tag}" with Yatai..'):
@@ -254,7 +258,7 @@ class YataiClient(CloudClient):
             )
             try:
                 if presigned_upload_url is not None:
-                    resp = requests.put(presigned_upload_url, data=tar_io)
+                    resp = httpx.put(presigned_upload_url, data=tar_io)
                     if resp.status_code != 200:
                         finish_req = FinishUploadBentoSchema(
                             status=BentoUploadStatus.FAILED,
@@ -309,7 +313,7 @@ class YataiClient(CloudClient):
                             )
 
                             with CallbackIOWrapper(chunk, read_cb=io_cb) as chunk_io:
-                                resp = requests.put(
+                                resp = httpx.put(
                                     remote_bento.presigned_upload_url, data=chunk_io
                                 )
                                 if resp.status_code != 200:
@@ -498,27 +502,27 @@ class YataiClient(CloudClient):
                             name, version
                         )
                         presigned_download_url = remote_bento.presigned_download_url
-                response = requests.get(presigned_download_url, stream=True)
 
-            if response.status_code != 200:
-                raise BentoMLException(
-                    f'Failed to download bento "{_tag}": {response.text}'
-                )
-            total_size_in_bytes = int(response.headers.get("content-length", 0))
-            block_size = 1024  # 1 Kibibyte
             with NamedTemporaryFile() as tar_file:
-                self.transmission_progress.update(
-                    download_task_id,
-                    completed=0,
-                    total=total_size_in_bytes,
-                    visible=True,
-                )
-                self.transmission_progress.start_task(download_task_id)
-                for data in response.iter_content(block_size):
+                with httpx.stream("GET", presigned_download_url) as response:
+                    if response.status_code != 200:
+                        raise BentoMLException(
+                            f'Failed to download bento "{_tag}": {response.text}'
+                        )
+                    total_size_in_bytes = int(response.headers.get("content-length", 0))
+                    block_size = 1024  # 1 Kibibyte
                     self.transmission_progress.update(
-                        download_task_id, advance=len(data)
+                        download_task_id,
+                        completed=0,
+                        total=total_size_in_bytes,
+                        visible=True,
                     )
-                    tar_file.write(data)
+                    self.transmission_progress.start_task(download_task_id)
+                    for data in response.iter_bytes(block_size):
+                        self.transmission_progress.update(
+                            download_task_id, advance=len(data)
+                        )
+                        tar_file.write(data)
                 self.log_progress.add_task(
                     f'[bold green]Finished downloading all bento "{_tag}" files'
                 )
@@ -690,7 +694,7 @@ class YataiClient(CloudClient):
             )
             try:
                 if presigned_upload_url is not None:
-                    resp = requests.put(presigned_upload_url, data=tar_io)
+                    resp = httpx.put(presigned_upload_url, data=tar_io)
                     if resp.status_code != 200:
                         finish_req = FinishUploadModelSchema(
                             status=ModelUploadStatus.FAILED,
@@ -746,8 +750,8 @@ class YataiClient(CloudClient):
                             )
 
                             with CallbackIOWrapper(chunk, read_cb=io_cb) as chunk_io:
-                                resp = requests.put(
-                                    remote_model.presigned_upload_url, data=chunk_io
+                                resp = httpx.put(
+                                    remote_model.presigned_upload_url, content=chunk_io
                                 )
                                 if resp.status_code != 200:
                                     return FinishUploadModelSchema(
@@ -937,25 +941,26 @@ class YataiClient(CloudClient):
                     )
                     presigned_download_url = remote_model.presigned_download_url
 
-            response = requests.get(presigned_download_url, stream=True)
-            if response.status_code != 200:
-                raise BentoMLException(
-                    f'Failed to download model "{_tag}": {response.text}'
-                )
-
-        total_size_in_bytes = int(response.headers.get("content-length", 0))
-        block_size = 1024  # 1 Kibibyte
         with NamedTemporaryFile() as tar_file:
-            self.transmission_progress.update(
-                download_task_id,
-                description=f'Downloading model "{_tag}"',
-                total=total_size_in_bytes,
-                visible=True,
-            )
-            self.transmission_progress.start_task(download_task_id)
-            for data in response.iter_content(block_size):
-                self.transmission_progress.update(download_task_id, advance=len(data))
-                tar_file.write(data)
+            with httpx.stream("GET", presigned_download_url) as response:
+                if response.status_code != 200:
+                    raise BentoMLException(
+                        f'Failed to download model "{_tag}": {response.text}'
+                    )
+                total_size_in_bytes = int(response.headers.get("content-length", 0))
+                block_size = 1024  # 1 Kibibyte
+                self.transmission_progress.update(
+                    download_task_id,
+                    description=f'Downloading model "{_tag}"',
+                    total=total_size_in_bytes,
+                    visible=True,
+                )
+                self.transmission_progress.start_task(download_task_id)
+                for data in response.iter_bytes(block_size):
+                    self.transmission_progress.update(
+                        download_task_id, advance=len(data)
+                    )
+                    tar_file.write(data)
             self.log_progress.add_task(
                 f'[bold green]Finished downloading model "{_tag}" files'
             )

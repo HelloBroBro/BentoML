@@ -4,53 +4,53 @@ import logging
 import typing as t
 from urllib.parse import urljoin
 
-import requests
+import httpx
 
 from ...exceptions import CloudRESTApiClientError
+from ...exceptions import NotFound
 from ..configuration import BENTOML_VERSION
-from .schemas import BentoRepositorySchema
-from .schemas import BentoSchema
-from .schemas import BentoWithRepositoryListSchema
-from .schemas import ClusterFullSchema
-from .schemas import ClusterListSchema
-from .schemas import CompleteMultipartUploadSchema
-from .schemas import CreateBentoRepositorySchema
-from .schemas import CreateBentoSchema
-from .schemas import CreateDeploymentSchema
-from .schemas import CreateModelRepositorySchema
-from .schemas import CreateModelSchema
-from .schemas import DeploymentListSchema
-from .schemas import DeploymentSchema
-from .schemas import FinishUploadBentoSchema
-from .schemas import FinishUploadModelSchema
-from .schemas import ModelRepositorySchema
-from .schemas import ModelSchema
-from .schemas import ModelWithRepositoryListSchema
-from .schemas import OrganizationSchema
-from .schemas import PreSignMultipartUploadUrlSchema
-from .schemas import UpdateBentoSchema
-from .schemas import UpdateDeploymentSchema
-from .schemas import UserSchema
-from .schemas import schema_from_json
-from .schemas import schema_from_object
-from .schemas import schema_to_json
+from .schemas.schemasv1 import BentoListSchema
+from .schemas.schemasv1 import BentoRepositorySchema
+from .schemas.schemasv1 import BentoSchema
+from .schemas.schemasv1 import BentoWithRepositoryListSchema
+from .schemas.schemasv1 import ClusterFullSchema
+from .schemas.schemasv1 import ClusterListSchema
+from .schemas.schemasv1 import CompleteMultipartUploadSchema
+from .schemas.schemasv1 import CreateBentoRepositorySchema
+from .schemas.schemasv1 import CreateBentoSchema
+from .schemas.schemasv1 import CreateDeploymentSchema as CreateDeploymentSchemaV1
+from .schemas.schemasv1 import CreateModelRepositorySchema
+from .schemas.schemasv1 import CreateModelSchema
+from .schemas.schemasv1 import DeploymentFullSchema
+from .schemas.schemasv1 import DeploymentListSchema
+from .schemas.schemasv1 import FinishUploadBentoSchema
+from .schemas.schemasv1 import FinishUploadModelSchema
+from .schemas.schemasv1 import ModelRepositorySchema
+from .schemas.schemasv1 import ModelSchema
+from .schemas.schemasv1 import ModelWithRepositoryListSchema
+from .schemas.schemasv1 import OrganizationSchema
+from .schemas.schemasv1 import PreSignMultipartUploadUrlSchema
+from .schemas.schemasv1 import ResourceInstanceSchema
+from .schemas.schemasv1 import UpdateBentoSchema
+from .schemas.schemasv1 import UpdateDeploymentSchema
+from .schemas.schemasv1 import UserSchema
+from .schemas.schemasv2 import CreateDeploymentSchema as CreateDeploymentSchemaV2
+from .schemas.schemasv2 import DeploymentFullSchema as DeploymentFullSchemaV2
+from .schemas.schemasv2 import DeploymentListSchema as DeploymentListSchemaV2
+from .schemas.schemasv2 import UpdateDeploymentSchema as UpdateDeploymentSchemaV2
+from .schemas.utils import schema_from_json
+from .schemas.utils import schema_from_object
+from .schemas.utils import schema_to_json
 
 logger = logging.getLogger(__name__)
 
 
-class RestApiClient:
-    def __init__(self, endpoint: str, api_token: str) -> None:
+class BaseRestApiClient:
+    def __init__(self, endpoint: str, session: httpx.Client) -> None:
         self.endpoint = endpoint
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "X-YATAI-API-TOKEN": api_token,
-                "Content-Type": "application/json",
-                "X-Bentoml-Version": BENTOML_VERSION,
-            }
-        )
+        self.session = session
 
-    def _is_not_found(self, resp: requests.Response) -> bool:
+    def _is_not_found(self, resp: httpx.Response) -> bool:
         # We used to return 400 for record not found, handle both cases
         return (
             resp.status_code == 404
@@ -58,12 +58,14 @@ class RestApiClient:
             and "record not found" in resp.text
         )
 
-    def _check_resp(self, resp: requests.Response) -> None:
+    def _check_resp(self, resp: httpx.Response) -> None:
         if resp.status_code != 200:
             raise CloudRESTApiClientError(
                 f"request failed with status code {resp.status_code}: {resp.text}"
             )
 
+
+class RestApiClientV1(BaseRestApiClient):
     def get_current_user(self) -> UserSchema | None:
         url = urljoin(self.endpoint, "/api/v1/auth/current")
         resp = self.session.get(url)
@@ -96,7 +98,7 @@ class RestApiClient:
         self, req: CreateBentoRepositorySchema
     ) -> BentoRepositorySchema:
         url = urljoin(self.endpoint, "/api/v1/bento_repositories")
-        resp = self.session.post(url, data=schema_to_json(req))
+        resp = self.session.post(url, content=schema_to_json(req))
         self._check_resp(resp)
         return schema_from_json(resp.text, BentoRepositorySchema)
 
@@ -111,13 +113,31 @@ class RestApiClient:
         self._check_resp(resp)
         return schema_from_json(resp.text, BentoSchema)
 
+    def list_bentos(
+        self, bento_repository_name: str, count: int = 1
+    ) -> BentoListSchema | None:
+        url = urljoin(
+            self.endpoint,
+            f"/api/v1/bento_repositories/{bento_repository_name}/bentos",
+        )
+        resp = self.session.get(
+            url,
+            params={
+                "count": count,
+            },
+        )
+        if self._is_not_found(resp):
+            return None
+        self._check_resp(resp)
+        return schema_from_json(resp.text, BentoListSchema)
+
     def create_bento(
         self, bento_repository_name: str, req: CreateBentoSchema
     ) -> BentoSchema:
         url = urljoin(
             self.endpoint, f"/api/v1/bento_repositories/{bento_repository_name}/bentos"
         )
-        resp = self.session.post(url, data=schema_to_json(req))
+        resp = self.session.post(url, content=schema_to_json(req))
         self._check_resp(resp)
         return schema_from_json(resp.text, BentoSchema)
 
@@ -128,7 +148,7 @@ class RestApiClient:
             self.endpoint,
             f"/api/v1/bento_repositories/{bento_repository_name}/bentos/{version}",
         )
-        resp = self.session.patch(url, data=schema_to_json(req))
+        resp = self.session.patch(url, content=schema_to_json(req))
         self._check_resp(resp)
         return schema_from_json(resp.text, BentoSchema)
 
@@ -175,7 +195,7 @@ class RestApiClient:
             self.endpoint,
             f"/api/v1/bento_repositories/{bento_repository_name}/bentos/{version}/presign_multipart_upload_url",
         )
-        resp = self.session.patch(url, data=schema_to_json(req))
+        resp = self.session.patch(url, content=schema_to_json(req))
         self._check_resp(resp)
         return schema_from_json(resp.text, BentoSchema)
 
@@ -189,7 +209,7 @@ class RestApiClient:
             self.endpoint,
             f"/api/v1/bento_repositories/{bento_repository_name}/bentos/{version}/complete_multipart_upload",
         )
-        resp = self.session.patch(url, data=schema_to_json(req))
+        resp = self.session.patch(url, content=schema_to_json(req))
         self._check_resp(resp)
         return schema_from_json(resp.text, BentoSchema)
 
@@ -211,7 +231,7 @@ class RestApiClient:
             self.endpoint,
             f"/api/v1/bento_repositories/{bento_repository_name}/bentos/{version}/finish_upload",
         )
-        resp = self.session.patch(url, data=schema_to_json(req))
+        resp = self.session.patch(url, content=schema_to_json(req))
         self._check_resp(resp)
         return schema_from_json(resp.text, BentoSchema)
 
@@ -224,7 +244,7 @@ class RestApiClient:
         )
         resp = self.session.put(
             url,
-            data=data,
+            content=data,
             headers=dict(
                 self.session.headers, **{"Content-Type": "application/octet-stream"}
             ),
@@ -234,14 +254,14 @@ class RestApiClient:
 
     def download_bento(
         self, bento_repository_name: str, version: str
-    ) -> requests.Response:
+    ) -> httpx.Response:
         url = urljoin(
             self.endpoint,
             f"/api/v1/bento_repositories/{bento_repository_name}/bentos/{version}/download",
         )
-        resp = self.session.get(url, stream=True)
-        self._check_resp(resp)
-        return resp
+        with self.session.stream("GET", url) as resp:
+            self._check_resp(resp)
+            return resp
 
     def get_model_repository(
         self, model_repository_name: str
@@ -259,7 +279,7 @@ class RestApiClient:
         self, req: CreateModelRepositorySchema
     ) -> ModelRepositorySchema:
         url = urljoin(self.endpoint, "/api/v1/model_repositories")
-        resp = self.session.post(url, data=schema_to_json(req))
+        resp = self.session.post(url, content=schema_to_json(req))
         self._check_resp(resp)
         return schema_from_json(resp.text, ModelRepositorySchema)
 
@@ -280,7 +300,7 @@ class RestApiClient:
         url = urljoin(
             self.endpoint, f"/api/v1/model_repositories/{model_repository_name}/models"
         )
-        resp = self.session.post(url, data=schema_to_json(req))
+        resp = self.session.post(url, content=schema_to_json(req))
         self._check_resp(resp)
         return schema_from_json(resp.text, ModelSchema)
 
@@ -327,7 +347,7 @@ class RestApiClient:
             self.endpoint,
             f"/api/v1/model_repositories/{model_repository_name}/models/{version}/presign_multipart_upload_url",
         )
-        resp = self.session.patch(url, data=schema_to_json(req))
+        resp = self.session.patch(url, content=schema_to_json(req))
         self._check_resp(resp)
         return schema_from_json(resp.text, ModelSchema)
 
@@ -341,7 +361,7 @@ class RestApiClient:
             self.endpoint,
             f"/api/v1/model_repositories/{model_repository_name}/models/{version}/complete_multipart_upload",
         )
-        resp = self.session.patch(url, data=schema_to_json(req))
+        resp = self.session.patch(url, content=schema_to_json(req))
         self._check_resp(resp)
         return schema_from_json(resp.text, ModelSchema)
 
@@ -363,7 +383,7 @@ class RestApiClient:
             self.endpoint,
             f"/api/v1/model_repositories/{model_repository_name}/models/{version}/finish_upload",
         )
-        resp = self.session.patch(url, data=schema_to_json(req))
+        resp = self.session.patch(url, content=schema_to_json(req))
         self._check_resp(resp)
         return schema_from_json(resp.text, ModelSchema)
 
@@ -376,7 +396,7 @@ class RestApiClient:
         )
         resp = self.session.put(
             url,
-            data=data,
+            content=data,
             headers=dict(
                 self.session.headers, **{"Content-Type": "application/octet-stream"}
             ),
@@ -386,14 +406,14 @@ class RestApiClient:
 
     def download_model(
         self, model_repository_name: str, version: str
-    ) -> requests.Response:
+    ) -> httpx.Response:
         url = urljoin(
             self.endpoint,
             f"/api/v1/model_repositories/{model_repository_name}/models/{version}/download",
         )
-        resp = self.session.get(url, stream=True)
-        self._check_resp(resp)
-        return resp
+        with self.session.stream("GET", url) as resp:
+            self._check_resp(resp)
+            return resp
 
     def get_bento_repositories_list(
         self, bento_repository_name: str
@@ -421,10 +441,20 @@ class RestApiClient:
         self._check_resp(resp)
         return schema_from_json(resp.text, ModelWithRepositoryListSchema)
 
-    def get_deployment_list(
-        self, cluster_name: str, **params: str | int | None
+    def get_cluster_deployment_list(
+        self, cluster: str, **params: str | int | None
     ) -> DeploymentListSchema | None:
-        url = urljoin(self.endpoint, f"/api/v1/clusters/{cluster_name}/deployments")
+        url = urljoin(self.endpoint, f"/api/v1/clusters/{cluster}/deployments")
+        resp = self.session.get(url, params=params)
+        if self._is_not_found(resp):
+            return None
+        self._check_resp(resp)
+        return schema_from_json(resp.text, DeploymentListSchema)
+
+    def get_organization_deployment_list(
+        self, **params: str | int | None
+    ) -> DeploymentListSchema | None:
+        url = urljoin(self.endpoint, "/api/v1/deployments")
         resp = self.session.get(url, params=params)
         if self._is_not_found(resp):
             return None
@@ -432,68 +462,68 @@ class RestApiClient:
         return schema_from_json(resp.text, DeploymentListSchema)
 
     def create_deployment(
-        self, cluster_name: str, create_schema: CreateDeploymentSchema
-    ) -> DeploymentSchema | None:
-        url = urljoin(self.endpoint, f"/api/v1/clusters/{cluster_name}/deployments")
-        resp = self.session.post(url, data=schema_to_json(create_schema))
+        self, cluster: str, create_schema: CreateDeploymentSchemaV1
+    ) -> DeploymentFullSchema | None:
+        url = urljoin(self.endpoint, f"/api/v1/clusters/{cluster}/deployments")
+        resp = self.session.post(url, content=schema_to_json(create_schema))
         self._check_resp(resp)
-        return schema_from_json(resp.text, DeploymentSchema)
+        return schema_from_json(resp.text, DeploymentFullSchema)
 
     def get_deployment(
-        self, cluster_name: str, kube_namespace: str, deployment_name: str
-    ) -> DeploymentSchema | None:
+        self, cluster: str, kube_namespace: str, name: str
+    ) -> DeploymentFullSchema | None:
         url = urljoin(
             self.endpoint,
-            f"/api/v1/clusters/{cluster_name}/namespaces/{kube_namespace}/deployments/{deployment_name}",
+            f"/api/v1/clusters/{cluster}/namespaces/{kube_namespace}/deployments/{name}",
         )
         resp = self.session.get(url)
         if self._is_not_found(resp):
             return None
         self._check_resp(resp)
-        return schema_from_json(resp.text, DeploymentSchema)
+        return schema_from_json(resp.text, DeploymentFullSchema)
 
     def update_deployment(
         self,
-        cluster_name: str,
+        cluster: str,
         kube_namespace: str,
-        deployment_name: str,
+        name: str,
         update_schema: UpdateDeploymentSchema,
-    ) -> DeploymentSchema | None:
+    ) -> DeploymentFullSchema | None:
         url = urljoin(
             self.endpoint,
-            f"/api/v1/clusters/{cluster_name}/namespaces/{kube_namespace}/deployments/{deployment_name}",
+            f"/api/v1/clusters/{cluster}/namespaces/{kube_namespace}/deployments/{name}",
         )
-        resp = self.session.patch(url, data=schema_to_json(update_schema))
+        resp = self.session.patch(url, content=schema_to_json(update_schema))
         if self._is_not_found(resp):
             return None
         self._check_resp(resp)
-        return schema_from_json(resp.text, DeploymentSchema)
+        return schema_from_json(resp.text, DeploymentFullSchema)
 
     def terminate_deployment(
-        self, cluster_name: str, kube_namespace: str, deployment_name: str
-    ) -> DeploymentSchema | None:
+        self, cluster: str, kube_namespace: str, name: str
+    ) -> DeploymentFullSchema | None:
         url = urljoin(
             self.endpoint,
-            f"/api/v1/clusters/{cluster_name}/namespaces/{kube_namespace}/deployments/{deployment_name}/terminate",
+            f"/api/v1/clusters/{cluster}/namespaces/{kube_namespace}/deployments/{name}/terminate",
         )
         resp = self.session.post(url)
         if self._is_not_found(resp):
             return None
         self._check_resp(resp)
-        return schema_from_json(resp.text, DeploymentSchema)
+        return schema_from_json(resp.text, DeploymentFullSchema)
 
     def delete_deployment(
-        self, cluster_name: str, kube_namespace: str, deployment_name: str
-    ) -> DeploymentSchema | None:
+        self, cluster: str, kube_namespace: str, name: str
+    ) -> DeploymentFullSchema | None:
         url = urljoin(
             self.endpoint,
-            f"/api/v1/clusters/{cluster_name}/namespaces/{kube_namespace}/deployments/{deployment_name}",
+            f"/api/v1/clusters/{cluster}/namespaces/{kube_namespace}/deployments/{name}",
         )
         resp = self.session.delete(url)
         if self._is_not_found(resp):
             return None
         self._check_resp(resp)
-        return schema_from_json(resp.text, DeploymentSchema)
+        return schema_from_json(resp.text, DeploymentFullSchema)
 
     def get_cluster_list(
         self, params: dict[str, str | int] | None = None
@@ -505,8 +535,8 @@ class RestApiClient:
         self._check_resp(resp)
         return schema_from_json(resp.text, ClusterListSchema)
 
-    def get_cluster(self, cluster_name: str) -> ClusterFullSchema | None:
-        url = urljoin(self.endpoint, f"/api/v1/clusters/{cluster_name}")
+    def get_cluster(self, cluster: str) -> ClusterFullSchema | None:
+        url = urljoin(self.endpoint, f"/api/v1/clusters/{cluster}")
         resp = self.session.get(url)
         if self._is_not_found(resp):
             return None
@@ -527,3 +557,132 @@ class RestApiClient:
         self._check_resp(resp)
         models = resp.json()["items"]
         return schema_from_object(models[0], ModelSchema) if models else None
+
+
+class RestApiClientV2(BaseRestApiClient):
+    def create_deployment(
+        self,
+        create_schema: CreateDeploymentSchemaV2,
+        cluster: str | None = None,
+    ) -> DeploymentFullSchemaV2:
+        url = urljoin(self.endpoint, "/api/v2/deployments")
+        resp = self.session.post(
+            url, content=schema_to_json(create_schema), params={"cluster": cluster}
+        )
+        self._check_resp(resp)
+        return schema_from_json(resp.text, DeploymentFullSchemaV2)
+
+    def update_deployment(
+        self,
+        name: str,
+        update_schema: UpdateDeploymentSchemaV2,
+        cluster: str | None = None,
+    ) -> DeploymentFullSchemaV2:
+        url = urljoin(
+            self.endpoint,
+            f"/api/v2/deployments/{name}",
+        )
+        data = schema_to_json(update_schema)
+        resp = self.session.put(url, content=data, params={"cluster": cluster})
+        if self._is_not_found(resp):
+            raise NotFound(f"Deployment {name} is not found: {resp.text}")
+        self._check_resp(resp)
+        return schema_from_json(resp.text, DeploymentFullSchemaV2)
+
+    def get_deployment(
+        self,
+        name: str,
+        cluster: str | None = None,
+    ) -> DeploymentFullSchemaV2:
+        url = urljoin(
+            self.endpoint,
+            f"/api/v2/deployments/{name}",
+        )
+        resp = self.session.get(url, params={"cluster": cluster})
+        if self._is_not_found(resp):
+            raise NotFound(f"Deployment {name} is not found: {resp.text}")
+        self._check_resp(resp)
+        return schema_from_json(resp.text, DeploymentFullSchemaV2)
+
+    def list_deployment(
+        self,
+        cluster: str | None = None,
+        all: bool | None = None,
+        # if both of the above is none, list default cluster's deployments
+        count: int | None = None,
+        q: str | None = None,
+        search: str | None = None,
+        start: int | None = None,
+    ) -> DeploymentListSchemaV2:
+        url = urljoin(self.endpoint, "/api/v2/deployments")
+        resp = self.session.get(
+            url,
+            params={
+                "cluster": cluster,
+                "all": all,
+                "count": count,
+                "q": q,
+                "search": search,
+                "start": start,
+            },
+        )
+        if self._is_not_found(resp):
+            raise NotFound(f"Deployment not found: {resp.text}")
+        self._check_resp(resp)
+        return schema_from_json(resp.text, DeploymentListSchemaV2)
+
+    def terminate_deployment(
+        self,
+        name: str,
+        cluster: str | None = None,
+    ) -> DeploymentFullSchemaV2:
+        url = urljoin(
+            self.endpoint,
+            f"/api/v2/deployments/{name}/terminate",
+        )
+        resp = self.session.post(url, params={"cluster": cluster})
+        if self._is_not_found(resp):
+            raise NotFound(f"Deployment {name} is not found: {resp.text}")
+        self._check_resp(resp)
+        return schema_from_json(resp.text, DeploymentFullSchemaV2)
+
+    def delete_deployment(
+        self,
+        name: str,
+        cluster: str | None = None,
+    ) -> DeploymentFullSchemaV2:
+        url = urljoin(
+            self.endpoint,
+            f"/api/v2/deployments/{name}",
+        )
+        resp = self.session.delete(url, params={"cluster": cluster})
+        if self._is_not_found(resp):
+            raise NotFound(f"Deployment {name} is not found: {resp.text}")
+        self._check_resp(resp)
+        return schema_from_json(resp.text, DeploymentFullSchemaV2)
+
+    def list_instance_types(
+        self,
+        cluster: str | None = None,
+    ) -> list[ResourceInstanceSchema]:
+        url = urljoin(
+            self.endpoint,
+            "/api/v1/instance_types",
+        )
+        resp = self.session.get(url, params={"cluster": cluster})
+        self._check_resp(resp)
+        return schema_from_json(resp.text, list[ResourceInstanceSchema])
+
+
+class RestApiClient:
+    def __init__(self, endpoint: str, api_token: str) -> None:
+        self.session = httpx.Client(timeout=60)
+        self.session.headers.update(
+            {
+                "X-YATAI-API-TOKEN": api_token,
+                "Content-Type": "application/json",
+                "X-Bentoml-Version": BENTOML_VERSION,
+            }
+        )
+        self.v2 = RestApiClientV2(endpoint, self.session)
+        self.v1 = RestApiClientV1(endpoint, self.session)

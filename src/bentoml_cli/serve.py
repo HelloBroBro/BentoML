@@ -95,12 +95,14 @@ def add_serve_command(cli: click.Group) -> None:
         help="Specify the number of API server workers to start. Default to number of available CPU cores in production mode",
         envvar="BENTOML_API_WORKERS",
         show_default=True,
+        hidden=True,
     )
     @click.option(
         "--timeout",
         type=click.INT,
         help="Specify the timeout (seconds) for API server and runners",
         envvar="BENTOML_TIMEOUT",
+        hidden=True,
     )
     @click.option(
         "--backlog",
@@ -108,6 +110,7 @@ def add_serve_command(cli: click.Group) -> None:
         default=BentoMLContainer.api_server_config.backlog.get(),
         help="The maximum number of pending connections.",
         show_default=True,
+        hidden=True,
     )
     @click.option(
         "--reload",
@@ -130,6 +133,7 @@ def add_serve_command(cli: click.Group) -> None:
         default=BentoMLContainer.ssl.certfile.get(),
         help="SSL certificate file",
         show_default=True,
+        hidden=True,
     )
     @click.option(
         "--ssl-keyfile",
@@ -137,6 +141,7 @@ def add_serve_command(cli: click.Group) -> None:
         default=BentoMLContainer.ssl.keyfile.get(),
         help="SSL key file",
         show_default=True,
+        hidden=True,
     )
     @click.option(
         "--ssl-keyfile-password",
@@ -144,6 +149,7 @@ def add_serve_command(cli: click.Group) -> None:
         default=BentoMLContainer.ssl.keyfile_password.get(),
         help="SSL keyfile password",
         show_default=True,
+        hidden=True,
     )
     @click.option(
         "--ssl-version",
@@ -151,6 +157,7 @@ def add_serve_command(cli: click.Group) -> None:
         default=BentoMLContainer.ssl.version.get(),
         help="SSL version to use (see stdlib 'ssl' module)",
         show_default=True,
+        hidden=True,
     )
     @click.option(
         "--ssl-cert-reqs",
@@ -158,6 +165,7 @@ def add_serve_command(cli: click.Group) -> None:
         default=BentoMLContainer.ssl.cert_reqs.get(),
         help="Whether client certificate is required (see stdlib 'ssl' module)",
         show_default=True,
+        hidden=True,
     )
     @click.option(
         "--ssl-ca-certs",
@@ -165,6 +173,7 @@ def add_serve_command(cli: click.Group) -> None:
         default=BentoMLContainer.ssl.ca_certs.get(),
         help="CA certificates file",
         show_default=True,
+        hidden=True,
     )
     @click.option(
         "--ssl-ciphers",
@@ -172,6 +181,7 @@ def add_serve_command(cli: click.Group) -> None:
         default=BentoMLContainer.ssl.ciphers.get(),
         help="Ciphers to use (see stdlib 'ssl' module)",
         show_default=True,
+        hidden=True,
     )
     @env_manager
     def serve(  # type: ignore (unused warning)
@@ -179,7 +189,7 @@ def add_serve_command(cli: click.Group) -> None:
         development: bool,
         port: int,
         host: str,
-        api_workers: int | None,
+        api_workers: int,
         timeout: int | None,
         backlog: int,
         reload: bool,
@@ -226,6 +236,9 @@ def add_serve_command(cli: click.Group) -> None:
         - when specified, respect 'include' and 'exclude' under 'bentofile.yaml' as well as the '.bentoignore' file in '--working-dir', for code and file changes
         - all model store changes will also trigger a restart (new model saved or existing model removed)
         """
+        from bentoml import Service
+        from bentoml._internal.service.loader import load
+
         configure_server_logging()
         if working_dir is None:
             if os.path.isdir(os.path.expanduser(bento)):
@@ -234,48 +247,73 @@ def add_serve_command(cli: click.Group) -> None:
                 working_dir = "."
         if sys.path[0] != working_dir:
             sys.path.insert(0, working_dir)
+        svc = load(bento_identifier=bento, working_dir=working_dir)
+        if isinstance(svc, Service):
+            # bentoml<1.2
+            from bentoml.serve import serve_http_production
 
-        from bentoml.serve import serve_http_production
-
-        if development:
-            serve_http_production(
-                bento,
-                working_dir=working_dir,
-                port=port,
-                host=DEFAULT_DEV_SERVER_HOST if not host else host,
-                backlog=backlog,
-                api_workers=1,
-                timeout=timeout,
-                ssl_keyfile=ssl_keyfile,
-                ssl_certfile=ssl_certfile,
-                ssl_keyfile_password=ssl_keyfile_password,
-                ssl_version=ssl_version,
-                ssl_cert_reqs=ssl_cert_reqs,
-                ssl_ca_certs=ssl_ca_certs,
-                ssl_ciphers=ssl_ciphers,
-                reload=reload,
-                development_mode=True,
-            )
+            if development:
+                serve_http_production(
+                    bento,
+                    working_dir=working_dir,
+                    port=port,
+                    host=DEFAULT_DEV_SERVER_HOST if not host else host,
+                    backlog=backlog,
+                    api_workers=1,
+                    timeout=timeout,
+                    ssl_keyfile=ssl_keyfile,
+                    ssl_certfile=ssl_certfile,
+                    ssl_keyfile_password=ssl_keyfile_password,
+                    ssl_version=ssl_version,
+                    ssl_cert_reqs=ssl_cert_reqs,
+                    ssl_ca_certs=ssl_ca_certs,
+                    ssl_ciphers=ssl_ciphers,
+                    reload=reload,
+                    development_mode=True,
+                )
+            else:
+                serve_http_production(
+                    bento,
+                    working_dir=working_dir,
+                    port=port,
+                    host=host,
+                    api_workers=api_workers,
+                    timeout=timeout,
+                    ssl_keyfile=ssl_keyfile,
+                    ssl_certfile=ssl_certfile,
+                    ssl_keyfile_password=ssl_keyfile_password,
+                    ssl_version=ssl_version,
+                    ssl_cert_reqs=ssl_cert_reqs,
+                    ssl_ca_certs=ssl_ca_certs,
+                    ssl_ciphers=ssl_ciphers,
+                    reload=reload,
+                    development_mode=False,
+                )
         else:
-            serve_http_production(
+            # bentoml>=1.2
+
+            from _bentoml_impl.server import serve_http
+
+            svc.inject_config()
+            serve_http(
                 bento,
                 working_dir=working_dir,
-                port=port,
                 host=host,
-                api_workers=api_workers,
+                port=port,
+                backlog=backlog,
                 timeout=timeout,
-                ssl_keyfile=ssl_keyfile,
                 ssl_certfile=ssl_certfile,
+                ssl_keyfile=ssl_keyfile,
                 ssl_keyfile_password=ssl_keyfile_password,
                 ssl_version=ssl_version,
                 ssl_cert_reqs=ssl_cert_reqs,
                 ssl_ca_certs=ssl_ca_certs,
                 ssl_ciphers=ssl_ciphers,
+                development_mode=development,
                 reload=reload,
-                development_mode=False,
             )
 
-    @cli.command(name="serve-grpc")
+    @cli.command(name="serve-grpc", hidden=True)
     @click.argument("bento", type=click.STRING, default=".")
     @click.option(
         "--development",

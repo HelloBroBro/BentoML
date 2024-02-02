@@ -54,6 +54,7 @@ dependencies = [
     "pip-requirements-parser>=31.2.0",
     "prometheus-client>=0.10.0",
     "psutil",
+    "pydantic<3",
     "python-dateutil",
     "python-multipart",
     "python-json-logger",
@@ -82,13 +83,12 @@ all = [
 ]
 aws = ["fs-s3fs"]
 io = [
-    "bentoml[io-json,io-image,io-pandas,io-file]",
+    "bentoml[io-image,io-pandas,io-file]",
 ]
 io-file = ["filetype"] # Currently use for from_sample
-io-json = ["pydantic<2"] # currently we don't have support for pydantic 2.0
 io-image = ["bentoml[io-file]", "Pillow"]
 io-pandas = ["pandas>=1", "pyarrow"]
-triton = ["tritonclient[all]>=2.29.0"]
+triton = ["tritonclient>=2.29.0", "tritonclient[all]; sys_platform != 'darwin'"]
 grpc = [
     "protobuf",
     "grpcio",
@@ -131,9 +131,9 @@ fallback_version = "0.0.0"
 [tool.hatch.metadata]
 allow-direct-references = true
 [tool.hatch.build.targets.sdist]
-only-include = ["src/bentoml", "src/bentoml_cli"]
+only-include = ["src/bentoml", "src/bentoml_cli", "src/_bentoml_sdk", "src/_bentoml_impl"]
 [tool.hatch.build.targets.wheel]
-packages = ["src/bentoml", "src/bentoml_cli"]
+packages = ["src/bentoml", "src/bentoml_cli", "src/_bentoml_sdk", "src/_bentoml_impl"]
 
 [[tool.pdm.source]]
 url = "https://download.pytorch.org/whl/cpu"
@@ -141,10 +141,6 @@ name = "torch"
 
 [tool.pdm.resolution]
 respect-source-order = true
-[tool.pdm.resolution.overrides]
-fastapi = "==0.93.0"
-tensorflow = ">=2.3.0"
-tensorflow-io-gcs-filesystem = "==0.31.0"
 
 [tool.pdm.dev-dependencies]
 docs = [
@@ -166,37 +162,9 @@ docs = [
     "pyspark",
     "ray[serve]",
 ]
-frameworks = [
-    "catboost",
-    "lightgbm",
-    "mlflow",
-    "fastai",
-    "xgboost",
-    "scikit-learn",
-    "easyocr",
-    "datasets",
-    # ONNX dependencies
-    "onnx",
-    "onnxruntime",
-    "skl2onnx",
-    # tensorflow dependencies
-    "tensorflow",
-    # torch-related dependencies
-    "torch",
-    "lightning",
-    # huggingface dependencies
-    "transformers",
-    "tokenizer",
-    "diffusers",
-    "flax; platform_system!='Windows'",
-    "jax; platform_system!='Windows'",
-    "jaxlib; platform_system!='Windows'",
-    "chex; platform_system!='Windows'",
-]
-tooling = ["pre-commit", "setuptools-scm", "pandas-stubs"]
+tooling = ["pre-commit", "setuptools-scm", "pandas-stubs", "nox"]
 testing = [
     "pandas>=1",
-    "pydantic<2",
     "scikit-learn",
     "yamllint==1.32.0",
     "coverage[toml]==7.2.6",
@@ -209,70 +177,6 @@ testing = [
     "build[virtualenv]==0.10.0",
     "Pillow<10",
 ]
-[tool.pdm.scripts]
-_.env = { TOKENIZERS_PARALLELISM = "false" }
-_run_test = { cmd = [
-    "python",
-    "-m",
-    "pytest",
-    "--cov=bentoml",
-    "--cov-report=term-missing",
-    "--cov-config=pyproject.toml",
-    "-vv",
-] }
-tests = { composite = ["_run_test {args:tests}"] }
-unit = { composite = [
-    "_run_test tests/unit -n auto",
-] }
-integration = { composite = [
-    "tests tests/integration/frameworks/test_frameworks.py --framework {args}",
-] }
-monitoring = { composite = [
-    "tests {args:examples/monitoring/task_classification}",
-] }
-e2e = { composite = [
-    "tests tests/e2e/bento_server_http",
-    "tests tests/e2e/bento_server_grpc",
-] }
-pre_all = "pdm sync -d -G io -G grpc -G triton -G tracing -G monitor-otlp -G grpc-reflection -G grpc-channelz -G aws"
-all = { composite = [
-    "unit",
-    "integration catboost",
-    "integration diffusers",
-    "integration easyocr",
-    "integration fastai",
-    "integration flax",
-    "integration keras",
-    "integration lightgbm",
-    "integration onnx",
-    "integration picklable_model",
-    "integration pytorch",
-    "integration pytorch_lightning",
-    "integration sklearn",
-    "integration tensorflow",
-    "integration torchscript",
-    "integration xgboost",
-    "integration detectron",
-    "integration transformers",
-    "monitoring",
-    "e2e",
-] }
-all-coverage = { composite = [
-    "all",
-    "coverage-combine",
-    "coverage-generate-reports",
-    "coverage-write-report",
-] }
-coverage-combine = "python -m coverage combine {args}"
-coverage-generate-summary = "python tools/generate_coverage.py"
-coverage-report-html = "python -m coverage html --skip-covered --skip-empty"
-coverage-report-xml = "python -m coverage xml"
-coverage-generate-reports = { composite = [
-    "coverage-report-xml",
-    "coverage-report-html",
-    "coverage-generate-summary",
-] }
-coverage-write-report = "python tools/write_report.py"
 
 [tool.coverage.paths]
 bentoml = ["src/bentoml", "*/bentoml/src/bentoml"]
@@ -377,7 +281,7 @@ convention = "google"
 
 [tool.ruff.isort]
 force-single-line = true
-known-first-party = ["bentoml"]
+known-first-party = ["bentoml", "bentoml_cli", "_bentoml_sdk", "_bentoml_impl"]
 
 [tool.pyright]
 pythonVersion = "3.12"

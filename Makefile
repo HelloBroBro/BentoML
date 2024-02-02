@@ -18,7 +18,7 @@ install: .pdm .pre-commit  ## Install the package, dependencies, and pre-commit 
 .PHONY: refresh-lockfiles
 refresh-lockfiles: .pdm  ## Sync lockfiles with requirements files.
 	pdm update --update-reuse -G all
-.PHONY: format format-proto lint lint-proto type style clean
+.PHONY: format format-proto lint lint-proto type style clean ui
 format: ## Running code formatter: black and isort
 	@echo "(black) Formatting codebase..."
 	@pre-commit run --all-files black-jupyter
@@ -41,8 +41,6 @@ clean: ## Clean all generated files
 	@find . -type f -name '*.py[co]' -delete -o -type d -name __pycache__ -delete
 
 # Docs
-watch-docs: ## Build and watch documentation
-	pdm run sphinx-autobuild docs/source docs/build/html --watch $(GIT_ROOT)/src/ --ignore "bazel-*"
 spellcheck-docs: ## Spell check documentation
 	pdm run sphinx-build -b spelling ./docs/source ./docs/build || (echo "Error running spellchecker.. You may need to run 'make install-spellchecker-deps'"; exit 1)
 OS := $(shell uname)

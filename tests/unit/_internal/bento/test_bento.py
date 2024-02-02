@@ -101,6 +101,10 @@ runners:
   - runner_a_model
   resource_config:
     cpu: 2
+entry_service: ''
+services: []
+envs: []
+schema: {{}}
 apis:
 - name: predict
   input_type: NumpyNdarray

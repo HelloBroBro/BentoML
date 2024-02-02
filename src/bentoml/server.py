@@ -30,6 +30,8 @@ from .exceptions import UnservableException
 if TYPE_CHECKING:
     from types import TracebackType
 
+    from _bentoml_sdk import Service as NewService
+
     _FILE: t.TypeAlias = None | int | t.IO[t.Any]
 
 
@@ -43,7 +45,7 @@ ClientType = t.TypeVar("ClientType", bound=Client)
 
 
 class Server(ABC, t.Generic[ClientType]):
-    servable: str | Bento | Tag | Service
+    servable: str | Bento | Tag | Service | NewService[t.Any]
     host: str
     port: int
 
@@ -54,7 +56,7 @@ class Server(ABC, t.Generic[ClientType]):
 
     def __init__(
         self,
-        servable: str | Bento | Tag | Service,
+        servable: str | Bento | Tag | Service | NewService[t.Any],
         serve_cmd: str,
         reload: bool,
         production: bool,
@@ -94,6 +96,9 @@ class Server(ABC, t.Generic[ClientType]):
                     "Cannot use 'bentoml.Service' as a server if it is defined in interactive session or Jupyter Notebooks."
                 )
             bento_str, working_dir = servable.get_service_import_origin()
+        elif not isinstance(servable, str):
+            bento_str = servable.import_string
+            working_dir = servable.working_dir
         else:
             bento_str = servable
 
@@ -153,7 +158,7 @@ class Server(ABC, t.Generic[ClientType]):
             text: Whether to output as text or bytes for stdout and stderr. Default to ``None``.
         """
         # NOTE: User shouldn't manually set this since this envvar will be managed by BentoML.
-        os.environ[BENTOML_SERVE_FROM_SERVER_API] = str(True)
+        os.environ[BENTOML_SERVE_FROM_SERVER_API] = "True"
 
         if env is None:
             env = {}
@@ -177,6 +182,7 @@ class Server(ABC, t.Generic[ClientType]):
                     # TODO: Make this default to True in 2.x
                     text=text if text is not None else False,
                 )
+                self.wait_until_ready()
 
                 if blocking:
                     try:
@@ -196,6 +202,10 @@ class Server(ABC, t.Generic[ClientType]):
                 self.stop()
 
         return _Manager()
+
+    @abstractmethod
+    def wait_until_ready(self) -> None:
+        pass
 
     def get_client(self) -> ClientType:
         if self.process is None:
@@ -219,13 +229,15 @@ class Server(ABC, t.Generic[ClientType]):
             if self.process.stdout is not None and not self.process.stdout.closed:
                 s = self.process.stdout.read()
                 logs += textwrap.indent(
-                    s.decode("utf-8") if isinstance(s, bytes) else s, " " * 4  # type: ignore  # may be string
+                    s.decode("utf-8") if isinstance(s, bytes) else s,
+                    " " * 4,  # type: ignore  # may be string
                 )
             if self.process.stderr is not None and not self.process.stderr.closed:
                 logs += "\nServer Error:\n"
                 s = self.process.stderr.read()
                 logs += textwrap.indent(
-                    s.decode("utf-8") if isinstance(s, bytes) else s, " " * 4  # type: ignore  # may be string
+                    s.decode("utf-8") if isinstance(s, bytes) else s,
+                    " " * 4,  # type: ignore  # may be string
                 )
             raise ServerStateException(logs)
         return self._get_client()
@@ -253,13 +265,15 @@ class Server(ABC, t.Generic[ClientType]):
             if self.process.stdout is not None and not self.process.stdout.closed:
                 s = self.process.stdout.read()
                 logs += textwrap.indent(
-                    s.decode("utf-8") if isinstance(s, bytes) else s, " " * 4  # type: ignore  # may be string
+                    s.decode("utf-8") if isinstance(s, bytes) else s,
+                    " " * 4,  # type: ignore  # may be string
                 )
             if self.process.stderr is not None and not self.process.stderr.closed:
                 logs += "\nServer Error:\n"
                 s = self.process.stderr.read()
                 logs += textwrap.indent(
-                    s.decode("utf-8") if isinstance(s, bytes) else s, " " * 4  # type: ignore  # may be string
+                    s.decode("utf-8") if isinstance(s, bytes) else s,
+                    " " * 4,  # type: ignore  # may be string
                 )
             logger.warning(logs)
             return
@@ -365,13 +379,13 @@ class HTTPServer(Server[HTTPClient]):
         )
         return self._get_client()
 
+    def wait_until_ready(self) -> None:
+        HTTPClient.wait_until_server_ready(
+            host=self.host, port=self.port, timeout=self.timeout
+        )
+
     def _get_client(self) -> HTTPClient:
         if self._client is None:
-            from .client import HTTPClient
-
-            HTTPClient.wait_until_server_ready(
-                host=self.host, port=self.port, timeout=self.timeout
-            )
             self._client = HTTPClient.from_url(f"http://{self.host}:{self.port}")
         return self._client
 
@@ -435,12 +449,12 @@ class GrpcServer(Server[GrpcClient]):
         if grpc_protocol_version is not None:
             self.args.extend(["--protocol-version", str(grpc_protocol_version)])
 
+    def wait_until_ready(self) -> None:
+        GrpcClient.wait_until_server_ready(
+            host=self.host, port=self.port, timeout=self.timeout
+        )
+
     def _get_client(self) -> GrpcClient:
         if self._client is None:
-            from .client import GrpcClient
-
-            GrpcClient.wait_until_server_ready(
-                host=self.host, port=self.port, timeout=self.timeout
-            )
             self._client = GrpcClient.from_url(f"{self.host}:{self.port}")
         return self._client
