@@ -25,7 +25,7 @@ This chapter introduces the key features of BentoML. We recommend you read :doc:
         :link: /guides/deployment
         :link-type: doc
 
-        Deploy your BentoML project to BentoCloud and customize deployment configurations.
+        Gain a general understanding of BentoCloud deployment.
 
     .. grid-item-card:: :doc:`/guides/containerization`
         :link: /guides/containerization
@@ -33,11 +33,23 @@ This chapter introduces the key features of BentoML. We recommend you read :doc:
 
         Create an OCI-compliant image for your BentoML project and deploy it anywhere.
 
+    .. grid-item-card:: :doc:`/guides/build-options`
+        :link: /guides/build-options
+        :link-type: doc
+
+        Customize the build configurations of a Bento.
+
     .. grid-item-card:: :doc:`/guides/model-store`
         :link: /guides/model-store
         :link-type: doc
 
         Use the BentoML local Model Store to manage your models in a unified way.
+
+    .. grid-item-card:: :doc:`/guides/distributed-services`
+        :link: /guides/distributed-services
+        :link-type: doc
+
+        Create distributed Services for advanced use cases.
 
     .. grid-item-card:: :doc:`/guides/clients`
         :link: /guides/clients
@@ -58,6 +70,8 @@ This chapter introduces the key features of BentoML. We recommend you read :doc:
     iotypes
     deployment
     containerization
+    build-options
     model-store
+    distributed-services
     clients
     configurations
