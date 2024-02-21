@@ -12,30 +12,10 @@ Specifically, BentoCloud features:
 - Flexible APIs for continuous integration and deployments (CI/CD).
 - Built-in observability tools for monitoring model performance and troubleshooting.
 
-Plans
------
-
-BentoCloud is available with the following two plans.
-
-Starter
-^^^^^^^
-
-The Starter plan is designed for small teams of developers who want to focus on building AI applications without infrastructure management. With the autoscaling feature of BentoCloud, you only pay for the resources you use.
-
-Enterprise
-^^^^^^^^^^
-
-The Enterprise plan includes all the features offered in the Starter plan. It is tailored for teams that want to use BentoCloud in :doc:`their own cloud or on-premises environment (BYOC) </bentocloud/how-tos/byoc>`, ensuring data security and compliance. If you prefer not to use your own cluster, we can provide a dedicated cloud environment for you. Either way, we take care of managing the infrastructure to ensure a scalable and secure model deployment experience.
-
 Access BentoCloud
 -----------------
 
-To gain access to BentoCloud, sign up here:
-
-.. raw:: html
-
-    <a href="https://kdyvd8c5ifq.typeform.com/to/eTujPAaE" class="custom-button demo">Schedule a Demo</a>
-    <a href="https://cloud.bentoml.com" class="custom-button trial">Start Free Trial</a>
+To gain access to BentoCloud, visit the `BentoML website <https://www.bentoml.com/>`_ to sign up.
 
 Once you have your BentoCloud account, do the following to get started:
 
@@ -63,14 +43,7 @@ Perform the following steps to quickly deploy an example application on BentoClo
       from transformers import pipeline
 
 
-      EXAMPLE_INPUT = "Breaking News: In an astonishing turn of events, the small \
-      town of Willow Creek has been taken by storm as local resident Jerry Thompson's cat, \
-      Whiskers, performed what witnesses are calling a 'miraculous and gravity-defying leap.' \
-      Eyewitnesses report that Whiskers, an otherwise unremarkable tabby cat, jumped \
-      a record-breaking 20 feet into the air to catch a fly. The event, which took \
-      place in Thompson's backyard, is now being investigated by scientists for potential \
-      breaches in the laws of physics. Local authorities are considering a town festival \
-      to celebrate what is being hailed as 'The Leap of the Century."
+      EXAMPLE_INPUT = "Breaking News: In an astonishing turn of events, the small town of Willow Creek has been taken by storm as local resident Jerry Thompson's cat, Whiskers, performed what witnesses are calling a 'miraculous and gravity-defying leap.' Eyewitnesses report that Whiskers, an otherwise unremarkable tabby cat, jumped a record-breaking 20 feet into the air to catch a fly. The event, which took place in Thompson's backyard, is now being investigated by scientists for potential breaches in the laws of physics. Local authorities are considering a town festival to celebrate what is being hailed as 'The Leap of the Century."
 
 
       @bentoml.service(
