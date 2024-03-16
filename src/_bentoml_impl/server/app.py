@@ -14,6 +14,7 @@ import pydantic
 from simple_di import Provide
 from simple_di import inject
 from starlette.middleware import Middleware
+from starlette.responses import Response
 from starlette.staticfiles import StaticFiles
 
 from _bentoml_sdk import Service
@@ -30,7 +31,6 @@ if t.TYPE_CHECKING:
     from opentelemetry.sdk.trace import Span
     from starlette.applications import Starlette
     from starlette.requests import Request
-    from starlette.responses import Response
     from starlette.routing import BaseRoute
 
     from bentoml._internal import external_typing as ext
@@ -191,6 +191,10 @@ class ServiceAppFactory(BaseAppFactory):
         app.add_exception_handler(BentoMLException, self.handle_bentoml_exception)
         app.add_exception_handler(Exception, self.handle_uncaught_exception)
         app.add_route("/schema.json", self.schema_view, name="schema")
+
+        for mount_app, path, name in self.service.mount_apps:
+            app.mount(app=mount_app, path=path, name=name)
+
         if self.is_main:
             if BentoMLContainer.new_index:
                 assets = Path(__file__).parent / "assets"
@@ -206,8 +210,7 @@ class ServiceAppFactory(BaseAppFactory):
                 )
                 app.add_route("/docs.json", self.openapi_spec_view, name="openapi-spec")
             app.add_route("/", self.index_page, name="index")
-        for mount_app, path, name in self.service.mount_apps:
-            app.mount(app=mount_app, path=path, name=name)
+
         return app
 
     @property
@@ -469,7 +472,10 @@ class ServiceAppFactory(BaseAppFactory):
         else:
             output = await self._to_thread(func, *input_args, **input_params)
 
-        response = await method.output_spec.to_http_response(output, serde)
+        if isinstance(output, Response):
+            response = output
+        else:
+            response = await method.output_spec.to_http_response(output, serde)
         response.headers.update({"Server": f"BentoML Service/{self.service.name}"})
 
         if method.ctx_param is not None:
