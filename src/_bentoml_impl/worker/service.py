@@ -83,6 +83,18 @@ import click
     help="Ciphers to use (see stdlib 'ssl' module)",
 )
 @click.option(
+    "--timeout-keep-alive",
+    type=int,
+    default=None,
+    help="Close Keep-Alive connections if no new data is received within this timeout.",
+)
+@click.option(
+    "--timeout-graceful-shutdown",
+    type=int,
+    default=None,
+    help="Maximum number of seconds to wait for graceful shutdown. After this timeout, the server will start terminating requests.",
+)
+@click.option(
     "--development-mode",
     type=click.BOOL,
     help="Run the API server in development mode",
@@ -111,12 +123,16 @@ def main(
     ssl_cert_reqs: int | None,
     ssl_ca_certs: str | None,
     ssl_ciphers: str | None,
+    timeout_keep_alive: int | None,
+    timeout_graceful_shutdown: int | None,
     development_mode: bool,
     timeout: int,
 ):
     """
     Start a HTTP server worker for given service.
     """
+    import socket
+
     import psutil
     import uvicorn
 
@@ -182,9 +198,8 @@ def main(
 
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())  # type: ignore
 
-    uvicorn.run(
+    config = uvicorn.Config(
         app=asgi_app,
-        fd=fd,
         backlog=backlog,
         log_config=None,
         workers=1,
@@ -192,9 +207,13 @@ def main(
         ssl_keyfile=ssl_keyfile,
         ssl_keyfile_password=ssl_keyfile_password,
         ssl_ca_certs=ssl_ca_certs,
+        timeout_keep_alive=timeout_keep_alive,
+        timeout_graceful_shutdown=timeout_graceful_shutdown,
         server_header=False,
         **uvicorn_extra_options,
     )
+    socket = socket.socket(fileno=fd)
+    uvicorn.Server(config).run(sockets=[socket])
 
 
 if __name__ == "__main__":
