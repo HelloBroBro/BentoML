@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import contextlib
 import importlib
+import logging
 import os
 import pathlib
 import sys
 import typing as t
 
 import yaml
+
+from bentoml._internal.context import server_context
 
 if t.TYPE_CHECKING:
     from _bentoml_sdk import Service
@@ -163,7 +167,6 @@ def import_service(
         assert (
             module_name and attrs_str
         ), f'Invalid import target "{service_identifier}", must format as "<module>:<attribute>"'
-
         module = importlib.import_module(module_name)
         root_service_name, _, depend_path = attrs_str.partition(".")
         root_service = t.cast("Service[t.Any]", getattr(module, root_service_name))
@@ -176,7 +179,8 @@ def import_service(
             svc = root_service
         else:
             svc = root_service.find_dependent(depend_path)
-        svc.bento = bento
+        if bento is not None:
+            svc.on_load_bento(bento)
         return svc
 
     except (ImportError, AttributeError, KeyError, AssertionError) as e:
@@ -194,9 +198,15 @@ def import_service(
 
         from bentoml.exceptions import ImportServiceError
 
-        raise ImportServiceError(
-            f'Failed to import service "{service_identifier}": {e}, sys.path: {sys_path}, cwd: {pathlib.Path.cwd()}'
-        ) from None
+        message = f'Failed to import service "{service_identifier}": {e}, sys.path: {sys_path}, cwd: {pathlib.Path.cwd()}'
+        if (
+            isinstance(e, ImportError)
+            and server_context.worker_index is None
+            and not (e.name or "").startswith(("bentoml", "_bentoml_"))
+        ):
+            message += "\nIf you are trying to import a runtime-only module, try wrapping it inside `with bentoml.importing():`"
+
+        raise ImportServiceError(message) from None
 
 
 def normalize_package(service_identifier: str) -> str:
@@ -207,3 +217,28 @@ def normalize_package(service_identifier: str) -> str:
     if package.endswith(".py"):
         package = package[:-3]
     return ":".join([package, service_path])
+
+
+@contextlib.contextmanager
+def importing() -> t.Iterator[None]:
+    """A context manager that suppresses the ImportError when importing runtime-specific modules.
+
+    Example:
+
+    .. code-block:: python
+
+        with bentoml.importing():
+            import torch
+            import tensorflow
+    """
+
+    logger = logging.getLogger("bentoml.service")
+
+    try:
+        yield
+    except ImportError as e:
+        if server_context.worker_index is not None:
+            raise
+        logger.info(
+            f"Skipping import of module {e.name} because it is not available in the current environment"
+        )

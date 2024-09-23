@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 
     from .. import external_typing as ext
     from ..bento import BentoStore
+    from ..cloud import BentoCloudClient
     from ..cloud.client import RestApiClient
     from ..models import ModelStore
     from ..server.metrics.prometheus import PrometheusClient
@@ -251,20 +252,6 @@ class _BentoMLContainerClass:
         "EXPORT_BENTO"
     )
     worker_index: providers.Static[int] = providers.Static(0)
-
-    @providers.SingletonFactory
-    @staticmethod
-    def yatai_client():
-        from ..cloud.yatai import YataiClient
-
-        return YataiClient()
-
-    @providers.SingletonFactory
-    @staticmethod
-    def bentocloud_client():
-        from ..cloud.bentocloud import BentoCloudClient
-
-        return BentoCloudClient()
 
     @providers.SingletonFactory
     @staticmethod
@@ -507,14 +494,28 @@ class _BentoMLContainerClass:
     def new_index(self) -> bool:
         return "new_index" in self.enabled_features.get()
 
-    cloud_context = providers.Static[t.Optional[str]](None)
-
-    @providers.Factory
+    @providers.SingletonFactory
     @staticmethod
-    def rest_api_client(context: str | None = Provide[cloud_context]) -> RestApiClient:
+    def cloud_context() -> str | None:
+        return os.getenv("BENTOML_CLOUD_CONTEXT")
+
+    @providers.SingletonFactory
+    @staticmethod
+    def rest_api_client(
+        context: str | None = Provide[cloud_context],
+    ) -> RestApiClient:
         from ..cloud.config import get_rest_api_client
 
         return get_rest_api_client(context)
+
+    @providers.SingletonFactory
+    @staticmethod
+    def bentocloud_client(
+        context: str | None = Provide[cloud_context],
+    ) -> BentoCloudClient:
+        from ..cloud import BentoCloudClient
+
+        return BentoCloudClient.for_context(context)
 
 
 BentoMLContainer = _BentoMLContainerClass()

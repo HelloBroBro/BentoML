@@ -83,6 +83,10 @@ class Model(StoreItem):
     _runnable: t.Type[Runnable] | None = attr.field(init=False, default=None)
 
     _model: t.Any = None
+    _attr: str | None = None
+
+    def __set_name__(self, owner: t.Any, name: str) -> None:
+        self._attr = name
 
     def __init__(
         self,

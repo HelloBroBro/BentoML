@@ -142,10 +142,11 @@ def construct_containerfile(
     features: t.Sequence[str] | None = None,
     add_header: bool = False,
 ) -> t.Generator[tuple[str, str], None, None]:
+    from _bentoml_sdk.models import BentoModel
+    from _bentoml_sdk.models import HuggingFaceModel
+
     from ..bento.bento import BentoInfo
     from ..bento.build_config import DockerOptions
-    from ..models import ModelStore
-    from ..models import copy_model
 
     dockerfile_path = "env/docker/Dockerfile"
     instruction: list[str] = []
@@ -158,14 +159,15 @@ def construct_containerfile(
         fs.mirror.mirror(bento._fs, temp_fs, copy_if_newer=True)
 
         # copy models from model store
-        model_store = BentoMLContainer.model_store.get()
-        bento_model_store = ModelStore(temp_fs.makedir("models", recreate=True))
+        bento_model_dir = temp_fs.makedir("models", recreate=True)
+        hf_model_dir = temp_fs.makedir("hf-models", recreate=True)
         for model in options.all_models:
-            copy_model(
-                model.tag,
-                src_model_store=model_store,
-                target_model_store=bento_model_store,
-            )
+            if model.registry == "huggingface":
+                model_ref = HuggingFaceModel.from_info(model)
+                model_ref.resolve(hf_model_dir)
+            else:
+                model_ref = BentoModel(model.tag)
+                model_ref.resolve(bento_model_dir)
 
         # NOTE: dockerfile_template is already included in the
         # Dockerfile inside bento, and it is not relevant to

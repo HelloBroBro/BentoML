@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import typing as t
-from abc import ABC
-from abc import abstractmethod
 from contextlib import contextmanager
 
 import attrs
+from rich import get_console
 from rich.console import Group
 from rich.live import Live
 from rich.panel import Panel
@@ -19,18 +18,13 @@ from rich.progress import TimeElapsedColumn
 from rich.progress import TimeRemainingColumn
 from rich.progress import TransferSpeedColumn
 
-from ..bento import Bento
-from ..bento import BentoStore
-from ..models import Model
-from ..models import ModelStore
-from ..tag import Tag
-
 if t.TYPE_CHECKING:
     from rich.console import Console
     from rich.console import ConsoleOptions
     from rich.console import RenderResult
 
 FILE_CHUNK_SIZE = 100 * 1024 * 1024  # 100Mb
+UPLOAD_RETRY_COUNT = 3
 
 
 @attrs.define
@@ -100,7 +94,8 @@ class Spinner:
     Use it as a context manager to start the live updating.
     """
 
-    def __init__(self):
+    def __init__(self, console: Console | None = None) -> None:
+        self.console = console or get_console()
         self.transmission_progress = Progress(
             TextColumn("[bold blue]{task.description}", justify="right"),
             BarColumn(bar_width=None),
@@ -111,6 +106,7 @@ class Spinner:
             TransferSpeedColumn(),
             "•",
             TimeRemainingColumn(),
+            console=self.console,
         )
 
         self._logs: list[str] = []
@@ -119,24 +115,21 @@ class Spinner:
             TimeElapsedColumn(),
             TextColumn("[bold purple]{task.description}"),
             SpinnerColumn("simpleDots"),
+            console=self.console,
         )
         self._spinner_task_id: t.Optional[TaskID] = None
-        self._live = Live(self)
-
-    @property
-    def console(self) -> "Console":
-        return self._live.console
+        self._live = Live(self, console=self.console)
 
     @contextmanager
     def spin(self, text: str) -> t.Generator[TaskID, None, None]:
         """Create a spinner as a context manager."""
+        task_id = self.update(text, new=True)
         try:
-            task_id = self.update(text, new=True)
             yield task_id
         finally:
-            self._spinner_task_id = None
-            self._spinner_progress.stop_task(task_id)
-            self._spinner_progress.update(task_id, visible=False)
+            self._spinner_progress.remove_task(task_id)
+            if self._spinner_task_id == task_id:
+                self._spinner_task_id = None
 
     def update(self, text: str, new: bool = False) -> TaskID:
         """Update the spin text."""
@@ -162,8 +155,7 @@ class Spinner:
     def stop(self) -> None:
         """Stop live updating."""
         if self._spinner_task_id is not None:
-            self._spinner_progress.stop_task(self._spinner_task_id)
-            self._spinner_progress.update(self._spinner_task_id, visible=False)
+            self._spinner_progress.remove_task(self._spinner_task_id)
             self._spinner_task_id = None
         self._live.stop()
 
@@ -177,49 +169,3 @@ class Spinner:
 
     def __exit__(self, *_: t.Any) -> None:
         self.stop()
-
-
-class CloudClient(ABC):
-    # Moved atrributes to __init__ because otherwise it will keep all the log when running SDK.
-    def __init__(self):
-        self.spinner = Spinner()
-
-    @abstractmethod
-    def push_model(
-        self,
-        model: Model,
-        *,
-        force: bool = False,
-        threads: int = 10,
-    ):
-        pass
-
-    @abstractmethod
-    def push_bento(
-        self,
-        bento: Bento,
-        *,
-        force: bool = False,
-        threads: int = 10,
-    ):
-        pass
-
-    @abstractmethod
-    def pull_model(
-        self,
-        tag: str | Tag,
-        *,
-        force: bool = False,
-        model_store: ModelStore,
-    ) -> Model:
-        pass
-
-    @abstractmethod
-    def pull_bento(
-        self,
-        tag: str | Tag,
-        *,
-        force: bool = False,
-        bento_store: BentoStore,
-    ) -> Bento:
-        pass

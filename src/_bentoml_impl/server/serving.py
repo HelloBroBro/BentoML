@@ -139,6 +139,9 @@ def server_on_deployment(
         member = getattr(svc.inner, name)
         if callable(member) and getattr(member, "__bentoml_deployment_hook__", False):
             member()
+    # Resolve models before server starts.
+    for model in svc.models:
+        model.resolve()
     if os.path.exists(result_file):
         os.remove(result_file)
 
@@ -329,7 +332,6 @@ def serve_http(
         if development_mode:
             arbiter_kwargs["debug"] = True
             arbiter_kwargs["loggerconfig"] = SERVER_LOGGING_CONFIG
-            arbiter_kwargs["loglevel"] = "WARNING"
 
         arbiter = create_standalone_arbiter(**arbiter_kwargs)
         arbiter.exit_stack.enter_context(

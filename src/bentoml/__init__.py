@@ -29,7 +29,7 @@ from pydantic import Field
 
 # BentoML built-in types
 from ._internal.bento import Bento
-from ._internal.cloud import YataiClient
+from ._internal.cloud import BentoCloudClient
 from ._internal.context import ServiceContext as Context
 from ._internal.context import server_context
 from ._internal.models import Model
@@ -61,6 +61,11 @@ if TYPE_CHECKING:
     from _bentoml_impl.frameworks import mlflow
     from _bentoml_impl.frameworks import sklearn
     from _bentoml_impl.frameworks import xgboost
+
+    try:  # needs bentoml-unsloth package
+        from _bentoml_impl.frameworks import unsloth
+    except ModuleNotFoundError:
+        pass
 
     from . import diffusers_simple
     from . import ray
@@ -95,6 +100,7 @@ if TYPE_CHECKING:
     # isort: on
     from _bentoml_impl.client import AsyncHTTPClient
     from _bentoml_impl.client import SyncHTTPClient
+    from _bentoml_impl.loader import importing
     from _bentoml_sdk import IODescriptor
     from _bentoml_sdk import api
     from _bentoml_sdk import depends
@@ -106,7 +112,7 @@ if TYPE_CHECKING:
     from _bentoml_sdk import service
     from _bentoml_sdk import task
 else:
-    from _bentoml_impl.frameworks import FrameworkImporter
+    from _bentoml_impl.frameworks.importer import FrameworkImporter
 
     from ._internal.utils import LazyLoader as _LazyLoader
     from ._internal.utils.pkg import pkg_version_info
@@ -211,20 +217,24 @@ else:
     def __getattr__(name: str) -> Any:
         if name in ("HTTPServer", "GrpcServer"):
             return getattr(server, name)
-        if name not in _NEW_SDK_ATTRS + _NEW_CLIENTS:
-            raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
         if _bentoml_sdk is None:
             raise ImportError(
                 f"The new SDK runs on pydantic>=2.0.0, but the you have {'.'.join(map(str, ver))}. "
                 "Please upgrade it."
             )
+        if name == "importing":
+            from _bentoml_impl.loader import importing
 
-        if name in _NEW_CLIENTS:
+            return importing
+        elif name in _NEW_CLIENTS:
             import _bentoml_impl.client
 
             return getattr(_bentoml_impl.client, name)
-        else:
+        elif name in _NEW_SDK_ATTRS:
             return getattr(_bentoml_sdk, name)
+        else:
+            raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [
@@ -244,7 +254,7 @@ __all__ = [
     "Runner",
     "Runnable",
     "monitoring",
-    "YataiClient",  # Yatai REST API Client
+    "BentoCloudClient",  # BentoCloud REST API Client
     # bento APIs
     "list",
     "get",
@@ -261,6 +271,7 @@ __all__ = [
     # Framework specific modules
     "catboost",
     "detectron",
+    "unsloth",
     "diffusers",
     "diffusers_simple",
     "easyocr",
@@ -305,4 +316,5 @@ __all__ = [
     # new implementation
     "SyncHTTPClient",
     "AsyncHTTPClient",
+    "importing",
 ]

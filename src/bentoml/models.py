@@ -19,6 +19,9 @@ from ._internal.utils.analytics import track
 from .exceptions import BentoMLException
 
 if TYPE_CHECKING:
+    from _bentoml_sdk.models import BentoModel
+    from _bentoml_sdk.models import HuggingFaceModel
+
     from ._internal.cloud import BentoCloudClient
     from ._internal.models import ModelStore
     from ._internal.models.model import ModelSignaturesType
@@ -212,10 +215,12 @@ def push(
     _model_store: "ModelStore" = Provide[BentoMLContainer.model_store],
     _cloud_client: BentoCloudClient = Provide[BentoMLContainer.bentocloud_client],
 ):
-    model_obj = _model_store.get(tag)
-    if not model_obj:
+    from _bentoml_sdk.models import BentoModel
+
+    model_obj = BentoModel(tag)
+    if model_obj.stored is None:
         raise BentoMLException(f"Model {tag} not found in local store")
-    _cloud_client.push_model(model_obj, force=force)
+    _cloud_client.model.push(model_obj, force=force)
 
 
 @inject
@@ -224,8 +229,8 @@ def pull(
     *,
     force: bool = False,
     _cloud_client: BentoCloudClient = Provide[BentoMLContainer.bentocloud_client],
-) -> Model:
-    return _cloud_client.pull_model(tag, force=force)
+) -> Model | None:
+    return _cloud_client.model.pull(tag, force=force)
 
 
 if t.TYPE_CHECKING:
@@ -373,6 +378,9 @@ def create(
         res.exit_cloudpickle_context(imported_modules)
 
 
+__new_sdk_members__ = ["BentoModel", "HuggingFaceModel"]
+
+
 __all__ = [
     "list",
     "get",
@@ -384,4 +392,18 @@ __all__ = [
     "ModelContext",
     "ModelOptions",
     "create",
+    "BentoModel",
+    "HuggingFaceModel",
 ]
+
+
+def __dir__() -> t.List[str]:
+    return __all__ + __new_sdk_members__
+
+
+def __getattr__(name: str) -> t.Any:
+    if name in __new_sdk_members__:
+        import _bentoml_sdk.models
+
+        return getattr(_bentoml_sdk.models, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

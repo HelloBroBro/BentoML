@@ -1,24 +1,39 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import typing as t
 from http import HTTPStatus
 
 import click
 import rich
+import rich.style
 import yaml
+from rich.console import Console
 from rich.syntax import Syntax
 from rich.table import Table
+from simple_di import Provide
+from simple_di import inject
 
+import bentoml.deployment
 from bentoml._internal.cloud.base import Spinner
+from bentoml._internal.cloud.client import RestApiClient
 from bentoml._internal.cloud.deployment import Deployment
 from bentoml._internal.cloud.deployment import DeploymentConfigParameters
+from bentoml._internal.cloud.schemas.modelschemas import DeploymentStatus
 from bentoml._internal.cloud.schemas.modelschemas import DeploymentStrategy
+from bentoml._internal.configuration.containers import BentoMLContainer
 from bentoml._internal.utils import rich_console as console
 from bentoml.exceptions import BentoMLException
+from bentoml.exceptions import CLIException
 from bentoml_cli.utils import BentoMLCommandGroup
 
+logger = logging.getLogger("bentoml.cli.deployment")
+
 if t.TYPE_CHECKING:
+    from bentoml._internal.cloud import BentoCloudClient
+
     TupleStrAny = tuple[str, ...]
 else:
     TupleStrAny = tuple
@@ -32,6 +47,23 @@ def raise_deployment_config_error(err: BentoMLException, action: str) -> t.NoRet
     raise BentoMLException(
         f"Failed to {action} deployment due to invalid configuration: {err}"
     ) from None
+
+
+def convert_env_to_dict(env: tuple[str] | None) -> list[dict[str, str]] | None:
+    if env is None:
+        return None
+    collected_envs: list[dict[str, str]] = []
+    if env:
+        for item in env:
+            if "=" in item:
+                name, value = item.split("=", 1)
+            else:
+                name = item
+                if name not in os.environ:
+                    raise CLIException(f"Environment variable {name} not found")
+                value = os.environ[name]
+            collected_envs.append({"name": name, "value": value})
+    return collected_envs
 
 
 @click.command(name="deploy")
@@ -81,7 +113,7 @@ def raise_deployment_config_error(err: BentoMLException, action: str) -> t.NoRet
 @click.option(
     "--env",
     type=click.STRING,
-    help="List of environment variables pass by --env key=value, --env ...",
+    help="List of environment variables pass by --env key[=value] --env ...",
     multiple=True,
 )
 @click.option(
@@ -186,6 +218,91 @@ def shared_decorator(
         return decorate
 
 
+@click.command(name="develop")
+@click.argument(
+    "bento_dir",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, readable=True),
+    default=".",
+)
+@click.option(
+    "--attach", help="Attach to the given deployment instead of creating a new one."
+)
+@click.option(
+    "--env",
+    type=click.STRING,
+    help="List of environment variables pass by --env key[=value] --env ...",
+    multiple=True,
+)
+@click.option(
+    "--secret",
+    type=click.STRING,
+    help="List of secret names pass by --secret name1, --secret name2, ...",
+    multiple=True,
+)
+@shared_decorator
+@inject
+def develop_command(
+    bento_dir: str,
+    cluster: str | None,
+    attach: str | None,
+    env: tuple[str] | None,
+    secret: tuple[str] | None,
+    _rest_client: RestApiClient = Provide[BentoMLContainer.rest_api_client],
+):
+    """Create or attach to a development deployment and watch for local file changes"""
+    import questionary
+
+    if attach and (env or secret):
+        raise CLIException("Cannot specify both --attach and --env or --secret")
+
+    console = Console(highlight=False)
+    if attach:
+        deployment = bentoml.deployment.get(attach)
+    else:
+        with console.status("Fetching deployments..."):
+            current_user = _rest_client.v1.get_current_user()
+            if current_user is None:
+                raise CLIException("current user is not found")
+            deployments = [
+                d
+                for d in bentoml.deployment.list(cluster=cluster, dev=True)
+                if d.is_dev
+                and d.created_by == current_user.name
+                and d.get_status(False).status
+                in [
+                    DeploymentStatus.Deploying.value,
+                    DeploymentStatus.Running.value,
+                    DeploymentStatus.ScaledToZero.value,
+                    DeploymentStatus.Failed.value,
+                ]
+            ]
+
+        chosen = questionary.select(
+            message="Select a deployment to attach to or create a new one",
+            choices=[{"name": d.name, "value": d} for d in deployments]
+            + [{"name": "Create a new deployment", "value": "new"}],
+        ).ask()
+
+        if chosen == "new":
+            deployment = create_deployment(
+                bento=bento_dir,
+                cluster=cluster,
+                dev=True,
+                wait=False,
+                env=env,
+                secret=secret,
+            )
+        elif chosen is None:
+            return
+        else:
+            if env or secret:
+                rich.print(
+                    "[yellow]Warning:[/] --env and --secret are ignored when attaching to an existing deployment"
+                )
+            deployment = t.cast(Deployment, chosen)
+    deployment.watch(bento_dir)
+
+
 @click.group(name="deployment", cls=BentoMLCommandGroup)
 def deployment_command():
     """Deployment Subcommands Groups"""
@@ -233,7 +350,13 @@ def deployment_command():
 @click.option(
     "--env",
     type=click.STRING,
-    help="List of environment variables pass by --env key=value, --env ...",
+    help="List of environment variables pass by --env key[=value] --env ...",
+    multiple=True,
+)
+@click.option(
+    "--secret",
+    type=click.STRING,
+    help="List of secret names pass by --secret name1, --secret name2, ...",
     multiple=True,
 )
 @click.option(
@@ -249,6 +372,7 @@ def deployment_command():
     help="Configuration json string",
     default=None,
 )
+@inject
 def update(  # type: ignore
     name: str | None,
     cluster: str | None,
@@ -259,8 +383,10 @@ def update(  # type: ignore
     instance_type: str | None,
     strategy: str | None,
     env: tuple[str] | None,
+    secret: tuple[str] | None,
     config_file: t.TextIO | None,
     config_dict: str | None,
+    _cloud_client: BentoCloudClient = Provide[BentoMLContainer.bentocloud_client],
 ) -> None:
     """Update a deployment on BentoCloud.
 
@@ -280,11 +406,8 @@ def update(  # type: ignore
         scaling_min=scaling_min,
         instance_type=instance_type,
         strategy=strategy,
-        envs=(
-            [{"name": item.split("=")[0], "value": item.split("=")[1]} for item in env]
-            if env is not None
-            else None
-        ),
+        envs=convert_env_to_dict(env),
+        secrets=list(secret) if secret is not None else None,
         config_file=config_file,
         config_dict=cfg_dict,
         cli=True,
@@ -293,7 +416,9 @@ def update(  # type: ignore
         config_params.verify()
     except BentoMLException as e:
         raise_deployment_config_error(e, "update")
-    deployment_info = Deployment.update(deployment_config_params=config_params)
+    deployment_info = _cloud_client.deployment.update(
+        deployment_config_params=config_params
+    )
 
     rich.print(f"Deployment [green]'{deployment_info.name}'[/] updated successfully.")
 
@@ -345,7 +470,13 @@ def update(  # type: ignore
 @click.option(
     "--env",
     type=click.STRING,
-    help="List of environment variables pass by --env key=value, --env ...",
+    help="List of environment variables pass by --env key[=value] --env ...",
+    multiple=True,
+)
+@click.option(
+    "--secret",
+    type=click.STRING,
+    help="List of secret names pass by --secret name1, --secret name2, ...",
     multiple=True,
 )
 @click.option(
@@ -367,6 +498,7 @@ def update(  # type: ignore
     help="Configuration json string",
     default=None,
 )
+@inject
 def apply(  # type: ignore
     bento: str | None,
     name: str | None,
@@ -377,8 +509,10 @@ def apply(  # type: ignore
     instance_type: str | None,
     strategy: str | None,
     env: tuple[str] | None,
+    secret: tuple[str] | None,
     config_file: str | t.TextIO | None,
     config_dict: str | None,
+    _cloud_client: BentoCloudClient = Provide[BentoMLContainer.bentocloud_client],
 ) -> None:
     """Apply a deployment on BentoCloud.
 
@@ -397,11 +531,8 @@ def apply(  # type: ignore
         scaling_min=scaling_min,
         instance_type=instance_type,
         strategy=strategy,
-        envs=(
-            [{"key": item.split("=")[0], "value": item.split("=")[1]} for item in env]
-            if env is not None
-            else None
-        ),
+        envs=convert_env_to_dict(env),
+        secrets=list(secret) if secret is not None else None,
         config_file=config_file,
         config_dict=cfg_dict,
         cli=True,
@@ -410,7 +541,9 @@ def apply(  # type: ignore
         config_params.verify()
     except BentoMLException as e:
         raise_deployment_config_error(e, "apply")
-    deployment_info = Deployment.apply(deployment_config_params=config_params)
+    deployment_info = _cloud_client.deployment.apply(
+        deployment_config_params=config_params
+    )
 
     rich.print(f"Deployment [green]'{deployment_info.name}'[/] applied successfully.")
 
@@ -462,7 +595,7 @@ def apply(  # type: ignore
 @click.option(
     "--env",
     type=click.STRING,
-    help="List of environment variables pass by --env key=value, --env ...",
+    help="List of environment variables pass by --env key[=value] --env ...",
     multiple=True,
 )
 @click.option(
@@ -550,7 +683,7 @@ def get(  # type: ignore
     output: t.Literal["json", "default"],
 ) -> None:
     """Get a deployment on BentoCloud."""
-    d = Deployment.get(name, cluster=cluster)
+    d = bentoml.deployment.get(name, cluster=cluster)
     if output == "json":
         info = json.dumps(d.to_dict(), indent=2, default=str)
         console.print_json(info)
@@ -566,11 +699,12 @@ def get(  # type: ignore
     type=click.STRING,
     required=True,
 )
+@click.option("--wait", is_flag=True, help="Wait for the deployment to be terminated")
 def terminate(  # type: ignore
-    name: str, cluster: str | None
+    name: str, cluster: str | None, wait: bool
 ) -> None:
     """Terminate a deployment on BentoCloud."""
-    Deployment.terminate(name, cluster=cluster)
+    bentoml.deployment.terminate(name, cluster=cluster, wait=wait)
     rich.print(f"Deployment [green]'{name}'[/] terminated successfully.")
 
 
@@ -585,7 +719,7 @@ def delete(  # type: ignore
     name: str, cluster: str | None
 ) -> None:
     """Delete a deployment on BentoCloud."""
-    Deployment.delete(name, cluster=cluster)
+    bentoml.deployment.delete(name, cluster=cluster)
     rich.print(f"Deployment [green]'{name}'[/] deleted successfully.")
 
 
@@ -608,7 +742,7 @@ def list_command(  # type: ignore
 ) -> None:
     """List existing deployments on BentoCloud."""
     try:
-        d_list = Deployment.list(cluster=cluster, search=search)
+        d_list = bentoml.deployment.list(cluster=cluster, search=search)
     except BentoMLException as e:
         raise_deployment_config_error(e, "list")
     res: list[dict[str, t.Any]] = [d.to_dict() for d in d_list]
@@ -645,13 +779,15 @@ def list_command(  # type: ignore
     type=click.Choice(["json", "yaml", "table"]),
     default="table",
 )
+@inject
 def list_instance_types(  # type: ignore
     cluster: str | None,
     output: t.Literal["json", "yaml", "table"],
+    _cloud_client: BentoCloudClient = Provide[BentoMLContainer.bentocloud_client],
 ) -> None:
     """List existing instance types in cluster on BentoCloud."""
     try:
-        d_list = Deployment.list_instance_types(cluster=cluster)
+        d_list = _cloud_client.deployment.list_instance_types(cluster=cluster)
     except BentoMLException as e:
         raise_deployment_config_error(e, "list_instance_types")
     res: list[dict[str, t.Any]] = [d.to_dict() for d in d_list]
@@ -681,25 +817,29 @@ def list_instance_types(  # type: ignore
         console.print(Syntax(info, "yaml", background_color="default"))
 
 
+@inject
 def create_deployment(
-    bento: str | None,
-    name: str | None,
-    cluster: str | None,
-    access_authorization: bool | None,
-    scaling_min: int | None,
-    scaling_max: int | None,
-    instance_type: str | None,
-    strategy: str | None,
-    env: tuple[str] | None,
-    secret: tuple[str] | None,
-    config_file: str | t.TextIO | None,
-    config_dict: str | None,
-    wait: bool,
-    timeout: int,
-) -> None:
+    bento: str | None = None,
+    name: str | None = None,
+    cluster: str | None = None,
+    access_authorization: bool | None = None,
+    scaling_min: int | None = None,
+    scaling_max: int | None = None,
+    instance_type: str | None = None,
+    strategy: str | None = None,
+    env: tuple[str] | None = None,
+    secret: tuple[str] | None = None,
+    config_file: str | t.TextIO | None = None,
+    config_dict: str | None = None,
+    wait: bool = True,
+    timeout: int = 3600,
+    dev: bool = False,
+    _cloud_client: BentoCloudClient = Provide[BentoMLContainer.bentocloud_client],
+) -> Deployment:
     cfg_dict = None
     if config_dict is not None and config_dict != "":
         cfg_dict = json.loads(config_dict)
+
     config_params = DeploymentConfigParameters(
         name=name,
         bento=bento,
@@ -709,23 +849,25 @@ def create_deployment(
         scaling_min=scaling_min,
         instance_type=instance_type,
         strategy=strategy,
-        envs=(
-            [{"name": item.split("=")[0], "value": item.split("=")[1]} for item in env]
-            if env is not None
-            else None
-        ),
-        secrets=secret,
+        envs=convert_env_to_dict(env),
+        secrets=list(secret) if secret is not None else None,
         config_file=config_file,
         config_dict=cfg_dict,
         cli=True,
+        dev=dev,
     )
+
     try:
         config_params.verify()
     except BentoMLException as e:
         raise_deployment_config_error(e, "create")
-    with Spinner() as spinner:
+
+    console = Console(highlight=False)
+    with Spinner(console=console) as spinner:
         spinner.update("Creating deployment on BentoCloud")
-        deployment = Deployment.create(deployment_config_params=config_params)
+        deployment = _cloud_client.deployment.create(
+            deployment_config_params=config_params
+        )
         spinner.log(
             f'✅ Created deployment "{deployment.name}" in cluster "{deployment.cluster}"'
         )
@@ -734,4 +876,7 @@ def create_deployment(
             spinner.update(
                 "[bold blue]Waiting for deployment to be ready, you can use --no-wait to skip this process[/]",
             )
-            deployment.wait_until_ready(timeout=timeout, spinner=spinner)
+            retcode = deployment.wait_until_ready(timeout=timeout, spinner=spinner)
+            if retcode != 0:
+                raise SystemExit(retcode)
+        return deployment

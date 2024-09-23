@@ -41,6 +41,7 @@ def import_service(
     *,
     working_dir: t.Optional[str] = None,
     standalone_load: bool = False,
+    reload: bool = False,
     model_store: ModelStore = Provide[BentoMLContainer.model_store],
 ) -> Service | NewService[t.Any]:
     """Import a Service instance from source code, by providing the svc_import_path
@@ -64,6 +65,8 @@ def import_service(
         import_service("fraud_detector")
     """
     from bentoml import Service
+
+    from ..context import server_context
 
     service_types: list[type] = [Service]
     try:
@@ -148,10 +151,18 @@ def import_service(
             module_name = import_path
 
         # Import the service using the Bento's own model store
+        needs_reload = module_name in sys.modules
         try:
             module = importlib.import_module(module_name, package=working_dir)
         except ImportError as e:
-            raise ImportServiceError(f'Failed to import module "{module_name}": {e}')
+            message = f'Failed to import module "{module_name}": {e}'
+            if server_context.worker_index is None and not (e.name or "").startswith(
+                ("bentoml", "_bentoml_")
+            ):
+                message += "\nIf you are trying to import a runtime-only module, try wrapping it inside `with bentoml.importing():`"
+            raise ImportServiceError(message)
+        if reload and needs_reload:
+            importlib.reload(module)
         if not standalone_load:
             recover_standalone_env_change()
 
