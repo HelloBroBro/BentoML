@@ -17,6 +17,9 @@ from bentoml._internal.types import PathType
 
 from .base import Model
 
+if t.TYPE_CHECKING:
+    from huggingface_hub import HfApi
+
 CONFIG_FILE = "config.json"
 DEFAULT_HF_ENDPOINT = "https://huggingface.co"
 
@@ -39,15 +42,17 @@ class HuggingFaceModel(Model[str]):
     endpoint: str | None = attrs.field(factory=lambda: os.getenv("HF_ENDPOINT"))
 
     @cached_property
-    def commit_hash(self) -> str:
-        from huggingface_hub import get_hf_file_metadata
-        from huggingface_hub import hf_hub_url
+    def _hf_api(self) -> HfApi:
+        from huggingface_hub import HfApi
 
-        url = hf_hub_url(
-            self.model_id, CONFIG_FILE, revision=self.revision, endpoint=self.endpoint
+        return HfApi(endpoint=self.endpoint)
+
+    @cached_property
+    def commit_hash(self) -> str:
+        return (
+            self._hf_api.model_info(self.model_id, revision=self.revision).sha
+            or self.revision
         )
-        metadata = get_hf_file_metadata(url)
-        return metadata.commit_hash or self.revision
 
     def resolve(self, base_path: t.Union[PathType, FS, None] = None) -> str:
         from huggingface_hub import snapshot_download
@@ -96,9 +101,9 @@ class HuggingFaceModel(Model[str]):
         )
 
     def _get_model_size(self, revision: str) -> int:
-        from huggingface_hub import model_info
-
-        info = model_info(self.model_id, revision=revision, files_metadata=True)
+        info = self._hf_api.model_info(
+            self.model_id, revision=revision, files_metadata=True
+        )
         return sum((file.size or 0) for file in (info.siblings or []))
 
     def to_create_schema(self) -> CreateModelSchema:
