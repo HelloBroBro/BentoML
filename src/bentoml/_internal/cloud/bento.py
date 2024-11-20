@@ -150,7 +150,7 @@ class BentoAPI:
         labels: list[LabelItemSchema] = [
             LabelItemSchema(key=key, value=value) for key, value in info.labels.items()
         ]
-        manifest = bento.get_manifest()
+        manifest = bento.get_manifest(dev=bare)
         if not remote_bento:
             with self.spinner.spin(
                 text=f'Registering Bento "{bento.tag}" with remote Bento store..'
@@ -495,6 +495,7 @@ class BentoAPI:
         with NamedTemporaryFile() as tar_file:
             with response_ctx as response:
                 if response.status_code != 200:
+                    response.read()
                     raise BentoMLException(
                         f'Failed to download bento "{_tag}": {response.text}'
                     )
